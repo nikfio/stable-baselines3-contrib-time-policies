@@ -18,6 +18,48 @@ from torch import nn
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
 
 
+class MultiLayerVarLSTM(nn.Module):
+    def __init__(self, input_size: int, hidden_sizes: list[int], **kwargs):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_sizes = hidden_sizes
+        self.num_layers = len(hidden_sizes)
+        self.hidden_size = max(hidden_sizes)
+        
+        layers = []
+        current_input_size = input_size
+        for h_size in hidden_sizes:
+            layers.append(nn.LSTM(current_input_size, h_size, num_layers=1, **kwargs))
+            current_input_size = h_size
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x: th.Tensor, states: tuple[th.Tensor, th.Tensor] | None = None) -> tuple[th.Tensor, tuple[th.Tensor, th.Tensor]]:
+        seq_len, batch_size, _ = x.shape
+        
+        if states is None:
+            h_out = x.new_zeros(self.num_layers, batch_size, self.hidden_size)
+            c_out = x.new_zeros(self.num_layers, batch_size, self.hidden_size)
+        else:
+            h_out, c_out = states
+            
+        new_h = x.new_zeros(self.num_layers, batch_size, self.hidden_size)
+        new_c = x.new_zeros(self.num_layers, batch_size, self.hidden_size)
+        
+        current_input = x
+        for i, layer in enumerate(self.layers):
+            h_i = h_out[i, :, :self.hidden_sizes[i]].unsqueeze(0)
+            c_i = c_out[i, :, :self.hidden_sizes[i]].unsqueeze(0)
+            
+            output, (next_h_i, next_c_i) = layer(current_input, (h_i, c_i))
+            
+            new_h[i, :, :self.hidden_sizes[i]] = next_h_i.squeeze(0)
+            new_c[i, :, :self.hidden_sizes[i]] = next_c_i.squeeze(0)
+            
+            current_input = output
+            
+        return current_input, (new_h, new_c)
+
+
 class RecurrentActorCriticPolicy(ActorCriticPolicy):
     """
     Recurrent policy class for actor-critic algorithms (has both policy and value prediction).
@@ -79,13 +121,20 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         normalize_images: bool = True,
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: dict[str, Any] | None = None,
-        lstm_hidden_size: int = 256,
+        lstm_hidden_size: int | list[int] = 256,
         n_lstm_layers: int = 1,
         shared_lstm: bool = False,
         enable_critic_lstm: bool = True,
         lstm_kwargs: dict[str, Any] | None = None,
     ):
-        self.lstm_output_dim = lstm_hidden_size
+        if isinstance(lstm_hidden_size, list):
+            self.lstm_output_dim = lstm_hidden_size[-1]
+            max_lstm_hidden_size = max(lstm_hidden_size)
+            n_lstm_layers = len(lstm_hidden_size)
+        else:
+            self.lstm_output_dim = lstm_hidden_size
+            max_lstm_hidden_size = lstm_hidden_size
+
         super().__init__(
             observation_space,
             action_space,
@@ -109,15 +158,23 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         self.lstm_kwargs = lstm_kwargs or {}
         self.shared_lstm = shared_lstm
         self.enable_critic_lstm = enable_critic_lstm
-        self.lstm_actor = nn.LSTM(
-            self.features_dim,
-            lstm_hidden_size,
-            num_layers=n_lstm_layers,
-            **self.lstm_kwargs,
-        )
+        
+        if isinstance(lstm_hidden_size, list):
+            self.lstm_actor = MultiLayerVarLSTM(
+                self.features_dim,
+                lstm_hidden_size,
+                **self.lstm_kwargs,
+            )
+        else:
+            self.lstm_actor = nn.LSTM(
+                self.features_dim,
+                lstm_hidden_size,
+                num_layers=n_lstm_layers,
+                **self.lstm_kwargs,
+            )
         # For the predict() method, to initialize hidden states
         # (n_lstm_layers, batch_size, lstm_hidden_size)
-        self.lstm_hidden_state_shape = (n_lstm_layers, 1, lstm_hidden_size)
+        self.lstm_hidden_state_shape = (n_lstm_layers, 1, max_lstm_hidden_size)
         self.critic = None
         self.lstm_critic = None
         assert not (
@@ -132,16 +189,23 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         # output of features extractor to the correct size
         # (size of the output of the actor lstm)
         if not (self.shared_lstm or self.enable_critic_lstm):
-            self.critic = nn.Linear(self.features_dim, lstm_hidden_size)
+            self.critic = nn.Linear(self.features_dim, self.lstm_output_dim)
 
         # Use a separate LSTM for the critic
         if self.enable_critic_lstm:
-            self.lstm_critic = nn.LSTM(
-                self.features_dim,
-                lstm_hidden_size,
-                num_layers=n_lstm_layers,
-                **self.lstm_kwargs,
-            )
+            if isinstance(lstm_hidden_size, list):
+                self.lstm_critic = MultiLayerVarLSTM(
+                    self.features_dim,
+                    lstm_hidden_size,
+                    **self.lstm_kwargs,
+                )
+            else:
+                self.lstm_critic = nn.LSTM(
+                    self.features_dim,
+                    lstm_hidden_size,
+                    num_layers=n_lstm_layers,
+                    **self.lstm_kwargs,
+                )
 
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
@@ -609,3 +673,139 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
             enable_critic_lstm,
             lstm_kwargs,
         )
+
+
+class TimeCNN(BaseFeaturesExtractor):
+    """
+    1D Temporal CNN Features Extractor for time-series / windowed observations.
+    Expects observations of shape (horizon_backward, single_time_size).
+    Convolves along the horizon_backward (time) dimension.
+    """
+    def __init__(
+        self,
+        observation_space: spaces.Box,
+        features_dim: int | None = None,
+        cnn_layers: list[int] | None = None,
+        n_cnn_layers: int = 2,
+    ):
+        assert isinstance(observation_space, spaces.Box), (
+            f"TimeCNN must be used with spaces.Box observation space, "
+            f"not {observation_space}"
+        )
+        
+        if cnn_layers is None:
+            cnn_layers = []
+            for i in range(n_cnn_layers):
+                if i == 0:
+                    out_channels = 64
+                else:
+                    out_channels = min(512, 64 * (2 ** i))
+                cnn_layers.append(out_channels)
+                
+        horizon_backward, in_channels = observation_space.shape
+        
+        layers = []
+        current_channels = in_channels
+        current_seq_len = horizon_backward
+        
+        for i, out_channels in enumerate(cnn_layers):
+            kernel_size = 5 if i == 0 else 3
+            padding = kernel_size // 2
+            
+            layers.append(
+                nn.Conv1d(
+                    in_channels=current_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    stride=1,
+                    padding=padding
+                )
+            )
+            layers.append(nn.ReLU())
+            
+            if current_seq_len >= 4:
+                layers.append(nn.MaxPool1d(kernel_size=2))
+                current_seq_len = current_seq_len // 2
+                
+            current_channels = out_channels
+            
+        layers.append(nn.Flatten())
+        cnn_seq = nn.Sequential(*layers)
+        
+        # Resolve flattened size dynamically using local cnn_seq
+        with th.no_grad():
+            dummy = th.as_tensor(observation_space.sample()[None]).float().transpose(1, 2)
+            n_flatten = cnn_seq(dummy).shape[1]
+            
+        features_dim_resolved = n_flatten if features_dim is None else features_dim
+        super().__init__(observation_space, features_dim_resolved)
+        
+        # Assign submodules to self now that super().__init__ has been called
+        self.cnn = cnn_seq
+        if features_dim is None:
+            self.linear = nn.Identity()
+        else:
+            self.linear = nn.Sequential(
+                nn.Linear(n_flatten, features_dim),
+                nn.ReLU()
+            )
+
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        # Transpose observations from (B, T, C) to (B, C, T) for Conv1d
+        return self.linear(self.cnn(observations.transpose(1, 2)))
+
+
+class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
+    """
+    Recurrent actor-critic policy with a 1D Temporal CNN features extractor.
+    """
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        lr_schedule: Schedule,
+        net_arch: list[int] | dict[str, list[int]] | None = None,
+        activation_fn: type[nn.Module] = nn.Tanh,
+        ortho_init: bool = True,
+        use_sde: bool = False,
+        log_std_init: float = 0.0,
+        full_std: bool = True,
+        use_expln: bool = False,
+        squash_output: bool = False,
+        features_extractor_class: type[BaseFeaturesExtractor] = TimeCNN,
+        features_extractor_kwargs: dict[str, Any] | None = None,
+        share_features_extractor: bool = True,
+        normalize_images: bool = True,
+        optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: dict[str, Any] | None = None,
+        lstm_hidden_size: int | list[int] = 256,
+        n_lstm_layers: int = 1,
+        shared_lstm: bool = False,
+        enable_critic_lstm: bool = True,
+        lstm_kwargs: dict[str, Any] | None = None,
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            net_arch,
+            activation_fn,
+            ortho_init,
+            use_sde,
+            log_std_init,
+            full_std,
+            use_expln,
+            squash_output,
+            features_extractor_class,
+            features_extractor_kwargs,
+            share_features_extractor,
+            normalize_images,
+            optimizer_class,
+            optimizer_kwargs,
+            lstm_hidden_size,
+            n_lstm_layers,
+            shared_lstm,
+            enable_critic_lstm,
+            lstm_kwargs,
+        )
+

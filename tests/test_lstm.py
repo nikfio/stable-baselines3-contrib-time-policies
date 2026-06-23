@@ -12,6 +12,8 @@ from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import VecNormalize
 
 from sb3_contrib import RecurrentPPO
+from sb3_contrib.common.recurrent.policies import MultiLayerVarLSTM
+from torch import nn
 
 
 class ToDictWrapper(gym.Wrapper):
@@ -263,3 +265,57 @@ def test_ppo_multi_dimensional_action_space():
     env = MultiDimensionalActionSpaceEnv()
     model = RecurrentPPO("MlpLstmPolicy", env, n_steps=64, n_epochs=2).learn(64)
     evaluate_policy(model, model.get_env())
+
+
+class DummyTime2DEnv(gym.Env):
+    def __init__(self):
+        super().__init__()
+        self.observation_space = spaces.Box(low=-1, high=1, shape=(10, 5), dtype=np.float32)
+        self.action_space = spaces.Discrete(2)
+        self._count = 0
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self._count = 0
+        return self.observation_space.sample(), {}
+
+    def step(self, action):
+        self._count += 1
+        done = self._count >= 10
+        return self.observation_space.sample(), 1.0, done, False, {}
+
+
+def test_time_cnn_lstm_policy():
+    env = DummyTime2DEnv()
+    model = RecurrentPPO(
+        "TimeCnnLstmPolicy",
+        env,
+        n_steps=16,
+        seed=0,
+        policy_kwargs=dict(
+            features_extractor_kwargs=dict(cnn_layers=[128, 48, 16]),
+            lstm_hidden_size=[64, 32],
+        ),
+        n_epochs=2,
+    )
+    model.learn(total_timesteps=32)
+    
+    # Assert model structures
+    policy = model.policy
+    assert policy.features_dim == 32
+    assert isinstance(policy.features_extractor.linear, nn.Identity)
+    
+    conv_layers = [m for m in policy.features_extractor.cnn if isinstance(m, nn.Conv1d)]
+    assert len(conv_layers) == 3
+    assert conv_layers[0].out_channels == 128
+    assert conv_layers[1].out_channels == 48
+    assert conv_layers[2].out_channels == 16
+
+    assert isinstance(policy.lstm_actor, MultiLayerVarLSTM)
+    assert policy.lstm_actor.hidden_sizes == [64, 32]
+    assert policy.lstm_actor.num_layers == 2
+    assert policy.lstm_actor.hidden_size == 64
+
+    # Check evaluate works
+    evaluate_policy(model, model.get_env())
+

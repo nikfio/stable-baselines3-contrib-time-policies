@@ -2,6 +2,31 @@
 
 [![CI](https://github.com/Stable-Baselines-Team/stable-baselines3-contrib/actions/workflows/ci.yml/badge.svg)](https://github.com/Stable-Baselines-Team/stable-baselines3-contrib/actions/workflows/ci.yml) [![codestyle](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
+# Fork of Stable-Baselines3-Contrib
+
+Changes made:
+- Added a new Policy in RecurrentPPO model: TimeCnnLstmPolicy
+
+  * adds a CNN feature extractor before the LSTM layers
+    the CNN layers are meant for 2D dimensional input data -> layer torch.nn.Conv1d
+  * the LSTM layers and CNN layers can be configured with a list-like value
+
+
+### Example of policy_kwargs configuration
+
+```python
+policy_kwargs:
+  features_extractor_kwargs:
+    cnn_layers: [10, 10, 10] # CNN stage: 3 layers of Conv1d with 10,10,10 filters each.
+  net_arch:
+    pi: [20, 15]        # Actor head: 2 layers of FC with 20,15 units each.
+    vf: [20, 15]        # Critic head: 2 layers of FC with 20,15 units each.
+  lstm_hidden_size: [10, 10]   # LSTM stage: 2 layers of LSTM with 10,10 units each.
+  enable_critic_lstm: True        # Whether to use LSTM for critic network
+```
+
+*The implementation has been aided by the use of LLM tools for the bulk of the legwork.*
+
 # Stable-Baselines3 - Contrib (SB3-Contrib)
 
 Contrib package for [Stable-Baselines3](https://github.com/DLR-RM/stable-baselines3) - Experimental reinforcement learning (RL) code.

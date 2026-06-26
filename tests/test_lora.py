@@ -85,6 +85,18 @@ def test_time_cnn_lstm_policy(use_lora):
         assert hasattr(policy.lstm_critic, "parametrizations")
         assert not critic_params.weight_ih_l0.original.requires_grad
         assert critic_params.weight_ih_l0[0].lora_A.requires_grad
+
+        # Check CNN Conv1d parametrization
+        cnn_conv = policy.features_extractor.cnn[0]
+        assert hasattr(cnn_conv, "parametrizations")
+        assert not cnn_conv.parametrizations.weight.original.requires_grad
+        assert cnn_conv.parametrizations.weight[0].lora_A.requires_grad
+
+        # Check MLP head parametrization (action_net)
+        assert hasattr(policy.action_net, "parametrizations")
+        act_net_params = policy.action_net.parametrizations.weight
+        assert not act_net_params.original.requires_grad
+        assert act_net_params[0].lora_A.requires_grad
     else:
         # Check that traditional training mode does not use parametrization
         assert not hasattr(policy.lstm_actor, "parametrizations")
@@ -110,6 +122,12 @@ def test_time_cnn_lstm_policy(use_lora):
             policy.lstm_actor.parametrizations.weight_ih_l0.original
         )
         assert orig_weight_ih.grad is None
+
+        # Check that gradients were calculated for CNN LoRA parameters
+        cnn_conv = policy.features_extractor.cnn[0]
+        lora_A_cnn = cnn_conv.parametrizations.weight[0].lora_A
+        assert lora_A_cnn.grad is not None
+        assert torch.norm(lora_A_cnn.grad) > 0.0
     else:
         # Standard weights should have gradients
         assert policy.lstm_actor.weight_ih_l0.grad is not None

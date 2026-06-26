@@ -13,7 +13,6 @@ from sb3_contrib.common.recurrent.policies import (
 
 
 class LoraWeightParametrization(nn.Module):
-
     """
     LoRA (Low-Rank Adaptation) weight parametrization module.
     Computes: W_new = W_0 + (lora_B @ lora_A) * scaling
@@ -34,6 +33,35 @@ class LoraWeightParametrization(nn.Module):
         return X + (self.lora_B @ self.lora_A) * self.scaling
 
 
+class LoraConv1dParametrization(nn.Module):
+    """
+    LoRA (Low-Rank Adaptation) weight parametrization module
+    for 1D convolutions.
+    Reshapes weight tensor from (out_channels, in_channels, kernel_size)
+    to (out_channels, in_channels * kernel_size), applies standard LoRA,
+    and reshapes back.
+    """
+
+    def __init__(self, original_shape: tuple, rank: int, scaling: float):
+        super().__init__()
+        self.original_shape = original_shape
+        out_channels, in_channels, kernel_size = original_shape
+
+        self.lora_A = nn.Parameter(
+            torch.zeros(rank, in_channels * kernel_size)
+        )
+        self.lora_B = nn.Parameter(torch.zeros(out_channels, rank))
+        self.scaling = scaling
+
+        # Initialize lora_A and lora_B
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        delta_W_2d = (self.lora_B @ self.lora_A) * self.scaling
+        return X + delta_W_2d.view(self.original_shape)
+
+
 class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
     """
     Recurrent policy that combines a 1D CNN feature extractor with
@@ -45,6 +73,10 @@ class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
     :param use_lora: Whether to apply LoRA (True) or standard training (False)
     :param lora_rank: Rank for the LoRA adapter matrices
     :param lora_alpha: Scaling factor (alpha) for the LoRA adapters
+    :param target_lstm: Whether to apply LoRA to the LSTM weight parameters
+    :param target_cnn: Whether to apply LoRA to the CNN feature extractor
+    :param target_mlp: Whether to apply LoRA to the MLP policy/value
+        projection heads
     """
 
     def __init__(
@@ -55,6 +87,9 @@ class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
         use_lora: bool = True,
         lora_rank: int = 8,
         lora_alpha: int = 16,
+        target_lstm: bool = True,
+        target_cnn: bool = True,
+        target_mlp: bool = True,
         features_extractor_class: Type[BaseFeaturesExtractor] = TimeCNN,
         features_extractor_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
@@ -62,6 +97,9 @@ class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
         self.use_lora = use_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        self.target_lstm = target_lstm
+        self.target_cnn = target_cnn
+        self.target_mlp = target_mlp
 
         # Call parent constructor (creates LSTM layers and initial optimizer)
         super().__init__(
@@ -74,23 +112,31 @@ class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
         )
 
         if self.use_lora:
-            # Inject LoRA on Actor LSTM
-            self._apply_lora(self.lstm_actor)
+            # 1. Apply LoRA to LSTM layers
+            if self.target_lstm:
+                self._apply_lora_to_lstm(self.lstm_actor)
+                if self.lstm_critic is not None:
+                    self._apply_lora_to_lstm(self.lstm_critic)
 
-            # Inject LoRA on Critic LSTM (if separate critic LSTM is enabled)
-            if self.lstm_critic is not None:
-                self._apply_lora(self.lstm_critic)
+            # 2. Apply LoRA to CNN Feature Extractor
+            if self.target_cnn:
+                self._apply_lora_to_module(self.features_extractor)
+
+            # 3. Apply LoRA to MLP heads (mlp_extractor, action_net, value_net)
+            if self.target_mlp:
+                self._apply_lora_to_module(self.mlp_extractor)
+                self._apply_lora_to_module(self.action_net)
+                self._apply_lora_to_module(self.value_net)
 
             # Re-initialize the optimizer to only track parameters
             # with requires_grad=True.
-            # This prevents AdamW from allocating VRAM for frozen base weights.
             self.optimizer = self.optimizer_class(
                 filter(lambda p: p.requires_grad, self.parameters()),
                 lr=lr_schedule(1),
                 **self.optimizer_kwargs,
             )
 
-    def _apply_lora(self, lstm_module: nn.LSTM) -> None:
+    def _apply_lora_to_lstm(self, lstm_module: nn.LSTM) -> None:
         scaling = self.lora_alpha / self.lora_rank
 
         # Collect parameter names first to avoid dictionary changed size error
@@ -111,3 +157,29 @@ class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
                     param.shape, self.lora_rank, scaling
                 ),
             )
+
+    def _apply_lora_to_module(self, module: nn.Module) -> None:
+        scaling = self.lora_alpha / self.lora_rank
+
+        # Traverse all child/sub-modules recursively
+        for _, submodule in module.named_modules():
+            # If the submodule is nn.Linear, apply standard 2D LoRA
+            if isinstance(submodule, nn.Linear):
+                submodule.weight.requires_grad = False
+                parametrize.register_parametrization(
+                    submodule,
+                    "weight",
+                    LoraWeightParametrization(
+                        submodule.weight.shape, self.lora_rank, scaling
+                    ),
+                )
+            # If the submodule is nn.Conv1d, apply 1D convolutional LoRA
+            elif isinstance(submodule, nn.Conv1d):
+                submodule.weight.requires_grad = False
+                parametrize.register_parametrization(
+                    submodule,
+                    "weight",
+                    LoraConv1dParametrization(
+                        submodule.weight.shape, self.lora_rank, scaling
+                    ),
+                )

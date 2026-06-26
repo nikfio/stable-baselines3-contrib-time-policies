@@ -1,52 +1,19 @@
 import math
-from typing import Any
+from typing import Any, Dict, Optional, Type
 import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
 from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import Schedule
-from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
-
-
-class TimeCnnFeatureExtractor(BaseFeaturesExtractor):
-    """
-    1D CNN feature extractor for time-series financial data.
-    Assumes observation space shape is (channels, sequence_length).
-    """
-
-    def __init__(
-        self,
-        observation_space: spaces.Space,
-        features_dim: int = 256
-    ):
-        super().__init__(observation_space, features_dim)
-        n_input_channels = observation_space.shape[0]
-
-        self.cnn = nn.Sequential(
-            nn.Conv1d(n_input_channels, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-
-        # Compute flattened shape dynamically
-        with torch.no_grad():
-            dummy = torch.as_tensor(observation_space.sample()[None]).float()
-            n_flatten = self.cnn(dummy).shape[1]
-
-        self.linear = nn.Sequential(
-            nn.Linear(n_flatten, features_dim),
-            nn.ReLU(),
-        )
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.linear(self.cnn(observations))
+from sb3_contrib.common.recurrent.policies import (
+    RecurrentActorCriticPolicy,
+    TimeCNN,
+)
 
 
 class LoraWeightParametrization(nn.Module):
+
     """
     LoRA (Low-Rank Adaptation) weight parametrization module.
     Computes: W_new = W_0 + (lora_B @ lora_A) * scaling
@@ -88,19 +55,22 @@ class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
         use_lora: bool = True,
         lora_rank: int = 8,
         lora_alpha: int = 16,
+        features_extractor_class: Type[BaseFeaturesExtractor] = TimeCNN,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ):
         self.use_lora = use_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
 
-        # Force the policy to use the custom 1D CNN extractor
-        kwargs["features_extractor_class"] = TimeCnnFeatureExtractor
-        kwargs["features_extractor_kwargs"] = dict(features_dim=256)
-
         # Call parent constructor (creates LSTM layers and initial optimizer)
         super().__init__(
-            observation_space, action_space, lr_schedule, **kwargs
+            observation_space,
+            action_space,
+            lr_schedule,
+            features_extractor_class=features_extractor_class,
+            features_extractor_kwargs=features_extractor_kwargs,
+            **kwargs
         )
 
         if self.use_lora:

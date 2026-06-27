@@ -33,6 +33,35 @@ class LoraWeightParametrization(nn.Module):
         return X + (self.lora_B @ self.lora_A) * self.scaling
 
 
+class LoraConv2dParametrization(nn.Module):
+    """
+    LoRA (Low-Rank Adaptation) weight parametrization module
+    for 2D convolutions.
+    Reshapes weight tensor from (out_channels, in_channels, kernel_height, kernel_width)
+    to (out_channels, in_channels * kernel_height * kernel_width), applies standard LoRA,
+    and reshapes back.
+    """
+
+    def __init__(self, original_shape: tuple, rank: int, scaling: float):
+        super().__init__()
+        self.original_shape = original_shape
+        out_channels, num_features, k_h, k_w = original_shape
+
+        self.lora_A = nn.Parameter(
+            torch.zeros(rank, num_features * k_h * k_w)
+        )
+        self.lora_B = nn.Parameter(torch.zeros(out_channels, rank))
+        self.scaling = scaling
+
+        # Initialize lora_A and lora_B
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        delta_W = (self.lora_B @ self.lora_A) * self.scaling
+        return X + delta_W.view(self.original_shape)
+
+
 class LoraConv1dParametrization(nn.Module):
     """
     LoRA (Low-Rank Adaptation) weight parametrization module
@@ -45,10 +74,10 @@ class LoraConv1dParametrization(nn.Module):
     def __init__(self, original_shape: tuple, rank: int, scaling: float):
         super().__init__()
         self.original_shape = original_shape
-        out_channels, in_channels, kernel_size = original_shape
+        out_channels, num_features, kernel_size = original_shape
 
         self.lora_A = nn.Parameter(
-            torch.zeros(rank, in_channels * kernel_size)
+            torch.zeros(rank, num_features * kernel_size)
         )
         self.lora_B = nn.Parameter(torch.zeros(out_channels, rank))
         self.scaling = scaling
@@ -60,6 +89,7 @@ class LoraConv1dParametrization(nn.Module):
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         delta_W_2d = (self.lora_B @ self.lora_A) * self.scaling
         return X + delta_W_2d.view(self.original_shape)
+
 
 
 class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
@@ -180,6 +210,16 @@ class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
                     submodule,
                     "weight",
                     LoraConv1dParametrization(
+                        submodule.weight.shape, self.lora_rank, scaling
+                    ),
+                )
+            # If the submodule is nn.Conv2d, apply 2D convolutional LoRA
+            elif isinstance(submodule, nn.Conv2d):
+                submodule.weight.requires_grad = False
+                parametrize.register_parametrization(
+                    submodule,
+                    "weight",
+                    LoraConv2dParametrization(
                         submodule.weight.shape, self.lora_rank, scaling
                     ),
                 )

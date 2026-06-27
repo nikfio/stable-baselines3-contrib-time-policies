@@ -11,14 +11,14 @@ from sb3_contrib.common.recurrent.policies_LoRA import TimeCnnLstmPolicy
 class DummyTimeSeriesEnv(gym.Env):
     """
     Dummy environment simulating a time-series/forex scenario
-    with observation shape (channels, sequence_length).
+    with observation shape (sequence_length, channels, features).
     """
 
     def __init__(self):
         super().__init__()
-        # 5 channels, 12 time steps (e.g. OHLCV over 12 windows)
+        # 12 steps, 5 channels, 4 features
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(5, 12), dtype=np.float32
+            low=-1.0, high=1.0, shape=(12, 5, 4), dtype=np.float32
         )
         self.action_space = spaces.Discrete(3)
         self._step = 0
@@ -86,7 +86,7 @@ def test_time_cnn_lstm_policy(use_lora):
         assert not critic_params.weight_ih_l0.original.requires_grad
         assert critic_params.weight_ih_l0[0].lora_A.requires_grad
 
-        # Check CNN Conv1d parametrization
+        # Check CNN Conv2d parametrization
         cnn_conv = policy.features_extractor.cnn[0]
         assert hasattr(cnn_conv, "parametrizations")
         assert not cnn_conv.parametrizations.weight.original.requires_grad

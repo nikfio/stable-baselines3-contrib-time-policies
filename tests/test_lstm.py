@@ -270,7 +270,7 @@ def test_ppo_multi_dimensional_action_space():
 class DummyTime2DEnv(gym.Env):
     def __init__(self):
         super().__init__()
-        self.observation_space = spaces.Box(low=-1, high=1, shape=(10, 5), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-1, high=1, shape=(10, 5, 4), dtype=np.float32)
         self.action_space = spaces.Discrete(2)
         self._count = 0
 
@@ -302,10 +302,10 @@ def test_time_cnn_lstm_policy():
     
     # Assert model structures
     policy = model.policy
-    assert policy.features_dim == 32
+    assert policy.features_dim == 64
     assert isinstance(policy.features_extractor.linear, nn.Identity)
     
-    conv_layers = [m for m in policy.features_extractor.cnn if isinstance(m, nn.Conv1d)]
+    conv_layers = [m for m in policy.features_extractor.cnn if isinstance(m, nn.Conv2d)]
     assert len(conv_layers) == 3
     assert conv_layers[0].out_channels == 128
     assert conv_layers[1].out_channels == 48

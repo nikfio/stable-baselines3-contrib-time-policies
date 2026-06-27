@@ -677,9 +677,9 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
 
 class TimeCNN(BaseFeaturesExtractor):
     """
-    1D Temporal CNN Features Extractor for time-series / windowed observations.
-    Expects observations of shape (horizon_backward, single_time_size).
-    Convolves along the horizon_backward (time) dimension.
+    2D CNN Features Extractor for time-series / windowed observations.
+    Expects observations of shape (horizon_backward, num_candles, 4).
+    Convolves along both the horizon_backward (time) and num_candles dimensions.
     """
     def __init__(
         self,
@@ -692,6 +692,10 @@ class TimeCNN(BaseFeaturesExtractor):
             f"TimeCNN must be used with spaces.Box observation space, "
             f"not {observation_space}"
         )
+        assert len(observation_space.shape) == 3, (
+            f"TimeCNN expects a 3D observation space (horizon_backward, num_candles, 4), "
+            f"got shape {observation_space.shape}"
+        )
         
         if cnn_layers is None:
             cnn_layers = []
@@ -702,18 +706,19 @@ class TimeCNN(BaseFeaturesExtractor):
                     out_channels = min(512, 64 * (2 ** i))
                 cnn_layers.append(out_channels)
                 
-        horizon_backward, in_channels = observation_space.shape
+        horizon_backward, num_candles, num_features = observation_space.shape
         
         layers = []
-        current_channels = in_channels
-        current_seq_len = horizon_backward
+        current_channels = num_features
+        current_height = horizon_backward
+        current_width = num_candles
         
         for i, out_channels in enumerate(cnn_layers):
             kernel_size = 5 if i == 0 else 3
             padding = kernel_size // 2
             
             layers.append(
-                nn.Conv1d(
+                nn.Conv2d(
                     in_channels=current_channels,
                     out_channels=out_channels,
                     kernel_size=kernel_size,
@@ -723,9 +728,13 @@ class TimeCNN(BaseFeaturesExtractor):
             )
             layers.append(nn.ReLU())
             
-            if current_seq_len >= 4:
-                layers.append(nn.MaxPool1d(kernel_size=2))
-                current_seq_len = current_seq_len // 2
+            # MaxPool2d pooling only when height/width is large enough to avoid shrinking to 0
+            pool_h = 2 if current_height >= 4 else 1
+            pool_w = 2 if current_width >= 4 else 1
+            if pool_h > 1 or pool_w > 1:
+                layers.append(nn.MaxPool2d(kernel_size=(pool_h, pool_w)))
+                current_height = current_height // pool_h
+                current_width = current_width // pool_w
                 
             current_channels = out_channels
             
@@ -734,7 +743,7 @@ class TimeCNN(BaseFeaturesExtractor):
         
         # Resolve flattened size dynamically using local cnn_seq
         with th.no_grad():
-            dummy = th.as_tensor(observation_space.sample()[None]).float().transpose(1, 2)
+            dummy = th.as_tensor(observation_space.sample()[None]).float().permute(0, 3, 1, 2)
             n_flatten = cnn_seq(dummy).shape[1]
             
         features_dim_resolved = n_flatten if features_dim is None else features_dim
@@ -751,8 +760,8 @@ class TimeCNN(BaseFeaturesExtractor):
             )
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
-        # Transpose observations from (B, T, C) to (B, C, T) for Conv1d
-        return self.linear(self.cnn(observations.transpose(1, 2)))
+        # Permute observations from (B, H, W, C) to (B, C, H, W) for Conv2d
+        return self.linear(self.cnn(observations.permute(0, 3, 1, 2)))
 
 
 # Import from policies_LoRA to support LoRA parametrization

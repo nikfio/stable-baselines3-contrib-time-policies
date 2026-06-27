@@ -84,7 +84,7 @@ class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
         observation_space: spaces.Space,
         action_space: spaces.Space,
         lr_schedule: Schedule,
-        use_lora: bool = True,
+        use_lora: bool = False,
         lora_rank: int = 8,
         lora_alpha: int = 16,
         target_lstm: bool = True,

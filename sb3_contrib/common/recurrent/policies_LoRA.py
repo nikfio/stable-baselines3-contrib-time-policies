@@ -166,6 +166,37 @@ class TimeCnnLstmPolicy(RecurrentActorCriticPolicy):
                 **self.optimizer_kwargs,
             )
 
+    def _process_sequence(
+        self,
+        features: torch.Tensor,
+        lstm_states: tuple[torch.Tensor, torch.Tensor],
+        episode_starts: torch.Tensor,
+        lstm: nn.LSTM,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Override parent _process_sequence to wrap LSTM calls inside
+        ``parametrize.cached()`` when LoRA is active.
+
+        Without caching, every ``lstm.forward()`` triggers
+        ``_update_flat_weights → _weights_have_changed → getattr``
+        which re-evaluates the LoRA parametrization and materializes
+        a **new** full-size weight tensor on GPU each time.
+        In the per-step loop (128 steps × 16 weight matrices × 2
+        LSTMs × 5 PPO epochs) this creates ~15 GB of transient
+        tensors in the autograd graph, causing OOM on 20 GB cards.
+
+        ``parametrize.cached()`` computes each parametrized weight
+        once and reuses it for all accesses within the context.
+        """
+        if self.use_lora and self.target_lstm:
+            with parametrize.cached():
+                return super()._process_sequence(
+                    features, lstm_states, episode_starts, lstm
+                )
+        return super()._process_sequence(
+            features, lstm_states, episode_starts, lstm
+        )
+
     def _apply_lora_to_lstm(self, lstm_module: nn.LSTM) -> None:
         scaling = self.lora_alpha / self.lora_rank
 

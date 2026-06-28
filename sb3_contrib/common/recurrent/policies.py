@@ -687,6 +687,7 @@ class TimeCNN(BaseFeaturesExtractor):
         features_dim: int | None = None,
         cnn_layers: list[int] | None = None,
         n_cnn_layers: int = 2,
+        fc_layers: list[int] | None = None,
     ):
         assert isinstance(observation_space, spaces.Box), (
             f"TimeCNN must be used with spaces.Box observation space, "
@@ -708,8 +709,20 @@ class TimeCNN(BaseFeaturesExtractor):
                 
         horizon_backward, num_candles, num_features = observation_space.shape
         
+        # Fully connected stage
+        if fc_layers is None:
+            fc_layers = [64]
+            
+        fc_modules = []
+        current_features = num_features
+        for out_features in fc_layers:
+            fc_modules.append(nn.Linear(current_features, out_features))
+            fc_modules.append(nn.ReLU())
+            current_features = out_features
+        fc_seq = nn.Sequential(*fc_modules)
+        
         layers = []
-        current_channels = num_features
+        current_channels = current_features
         current_height = horizon_backward
         current_width = num_candles
         
@@ -741,15 +754,17 @@ class TimeCNN(BaseFeaturesExtractor):
         layers.append(nn.Flatten())
         cnn_seq = nn.Sequential(*layers)
         
-        # Resolve flattened size dynamically using local cnn_seq
+        # Resolve flattened size dynamically using local cnn_seq and fc_seq
         with th.no_grad():
-            dummy = th.as_tensor(observation_space.sample()[None]).float().permute(0, 3, 1, 2)
-            n_flatten = cnn_seq(dummy).shape[1]
+            dummy = th.as_tensor(observation_space.sample()[None]).float()
+            dummy_fc = fc_seq(dummy)
+            n_flatten = cnn_seq(dummy_fc.permute(0, 3, 1, 2)).shape[1]
             
         features_dim_resolved = n_flatten if features_dim is None else features_dim
         super().__init__(observation_space, features_dim_resolved)
         
         # Assign submodules to self now that super().__init__ has been called
+        self.fc_stage = fc_seq
         self.cnn = cnn_seq
         if features_dim is None:
             self.linear = nn.Identity()
@@ -760,8 +775,10 @@ class TimeCNN(BaseFeaturesExtractor):
             )
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
-        # Permute observations from (B, H, W, C) to (B, C, H, W) for Conv2d
-        return self.linear(self.cnn(observations.permute(0, 3, 1, 2)))
+        # Pass observations through the fully connected stage
+        fc_out = self.fc_stage(observations)
+        # Permute observations from (B, H, W, C_fc) to (B, C_fc, H, W) for Conv2d
+        return self.linear(self.cnn(fc_out.permute(0, 3, 1, 2)))
 
 
 # Import from policies_LoRA to support LoRA parametrization

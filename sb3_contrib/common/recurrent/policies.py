@@ -775,10 +775,24 @@ class TimeCNN(BaseFeaturesExtractor):
             )
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
-        # Pass observations through the fully connected stage
-        fc_out = self.fc_stage(observations)
-        # Permute observations from (B, H, W, C_fc) to (B, C_fc, H, W) for Conv2d
-        return self.linear(self.cnn(fc_out.permute(0, 3, 1, 2)))
+        # Pass observations through the fully connected stage and CNN stage.
+        # Use PyTorch gradient checkpointing during training to avoid CUDA OOM.
+        def _forward_helper(obs: th.Tensor) -> th.Tensor:
+            fc_out = self.fc_stage(obs)
+            return self.cnn(fc_out.permute(0, 3, 1, 2))
+
+        if self.training:
+            from torch.utils.checkpoint import checkpoint
+            # Ensure observations requires grad so that checkpointing is triggered correctly
+            observations_checked = observations
+            if not observations_checked.requires_grad:
+                observations_checked = observations_checked.detach().requires_grad_(True)
+            cnn_out = checkpoint(_forward_helper, observations_checked, use_reentrant=False)
+        else:
+            cnn_out = _forward_helper(observations)
+
+        return self.linear(cnn_out)
+
 
 
 # Import from policies_LoRA to support LoRA parametrization

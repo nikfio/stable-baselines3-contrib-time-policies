@@ -688,14 +688,14 @@ class TimeCNN(BaseFeaturesExtractor):
         cnn_layers: list[int] | None = None,
         n_cnn_layers: int = 2,
         fc_layers: list[int] | None = None,
+        enable_fc: bool = True,
     ):
         assert isinstance(observation_space, spaces.Box), (
             f"TimeCNN must be used with spaces.Box observation space, "
             f"not {observation_space}"
         )
         assert len(observation_space.shape) == 3, (
-            f"TimeCNN expects a 3D observation space (horizon_backward, num_candles, 4), "
-            f"got shape {observation_space.shape}"
+            f"TimeCNN expects a 3D observation space, got shape {observation_space.shape}"
         )
         
         if cnn_layers is None:
@@ -707,24 +707,50 @@ class TimeCNN(BaseFeaturesExtractor):
                     out_channels = min(512, 64 * (2 ** i))
                 cnn_layers.append(out_channels)
                 
-        horizon_backward, num_candles, num_features = observation_space.shape
+        # Detect layout transposition based on shape comparison
+        # Default: (horizon_backward, num_candles, num_features)
+        # Transposed: (num_features, num_candles, horizon_backward)
+        is_transposed = (observation_space.shape[0] < observation_space.shape[2])
+        if is_transposed:
+            num_features, num_candles, horizon_backward = observation_space.shape
+        else:
+            horizon_backward, num_candles, num_features = observation_space.shape
+
+        self.is_transposed = is_transposed
+        self.enable_fc = enable_fc
         
         # Fully connected stage
-        if fc_layers is None:
-            fc_layers = [64]
-            
-        fc_modules = []
-        current_features = num_features
-        for out_features in fc_layers:
-            fc_modules.append(nn.Linear(current_features, out_features))
-            fc_modules.append(nn.ReLU())
-            current_features = out_features
-        fc_seq = nn.Sequential(*fc_modules)
+        fc_seq = None
+        if enable_fc:
+            if fc_layers is None:
+                fc_layers = [64]
+                
+            fc_modules = []
+            current_features = horizon_backward if is_transposed else num_features
+            for out_features in fc_layers:
+                fc_modules.append(nn.Linear(current_features, out_features))
+                fc_modules.append(nn.ReLU())
+                current_features = out_features
+            fc_seq = nn.Sequential(*fc_modules)
+            current_channels = current_features
+        else:
+            current_channels = num_features
         
         layers = []
-        current_channels = current_features
-        current_height = horizon_backward
-        current_width = num_candles
+        if enable_fc:
+            if is_transposed:
+                current_height = num_features
+                current_width = num_candles
+            else:
+                current_height = horizon_backward
+                current_width = num_candles
+        else:
+            if is_transposed:
+                current_height = num_candles
+                current_width = horizon_backward
+            else:
+                current_height = horizon_backward
+                current_width = num_candles
         
         for i, out_channels in enumerate(cnn_layers):
             kernel_size = 5 if i == 0 else 3
@@ -754,16 +780,24 @@ class TimeCNN(BaseFeaturesExtractor):
         layers.append(nn.Flatten())
         cnn_seq = nn.Sequential(*layers)
         
-        # Resolve flattened size dynamically using local cnn_seq and fc_seq
+        # Resolve flattened size dynamically using local cnn_seq and fc_stage
         with th.no_grad():
             dummy = th.as_tensor(observation_space.sample()[None]).float()
-            dummy_fc = fc_seq(dummy)
-            n_flatten = cnn_seq(dummy_fc.permute(0, 3, 1, 2)).shape[1]
+            if fc_seq is not None:
+                dummy_fc = fc_seq(dummy)
+                cnn_input = dummy_fc.permute(0, 3, 1, 2)
+            else:
+                if is_transposed:
+                    cnn_input = dummy
+                else:
+                    cnn_input = dummy.permute(0, 3, 1, 2)
+            n_flatten = cnn_seq(cnn_input).shape[1]
             
         features_dim_resolved = n_flatten if features_dim is None else features_dim
         super().__init__(observation_space, features_dim_resolved)
         
-        # Assign submodules to self now that super().__init__ has been called
+        self.is_transposed = is_transposed
+        self.enable_fc = enable_fc
         self.fc_stage = fc_seq
         self.cnn = cnn_seq
         if features_dim is None:
@@ -778,8 +812,15 @@ class TimeCNN(BaseFeaturesExtractor):
         # Pass observations through the fully connected stage and CNN stage.
         # Use PyTorch gradient checkpointing during training to avoid CUDA OOM.
         def _forward_helper(obs: th.Tensor) -> th.Tensor:
-            fc_out = self.fc_stage(obs)
-            return self.cnn(fc_out.permute(0, 3, 1, 2))
+            if self.fc_stage is not None:
+                fc_out = self.fc_stage(obs)
+                cnn_input = fc_out.permute(0, 3, 1, 2)
+            else:
+                if self.is_transposed:
+                    cnn_input = obs
+                else:
+                    cnn_input = obs.permute(0, 3, 1, 2)
+            return self.cnn(cnn_input)
 
         if self.training:
             from torch.utils.checkpoint import checkpoint

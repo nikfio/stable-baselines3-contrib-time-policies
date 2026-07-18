@@ -174,6 +174,7 @@ class TimeCnnLstmDdrqnPolicy(BasePolicy):
         state: Optional[tuple[np.ndarray, np.ndarray]] = None,
         episode_start: Optional[np.ndarray] = None,
         deterministic: bool = True,
+        temperature: float = 1.0,
     ) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
         self.set_training_mode(False)
         
@@ -203,7 +204,13 @@ class TimeCnnLstmDdrqnPolicy(BasePolicy):
                 episode_start_tensor = th.as_tensor(episode_start, device=self.device).float()
                 
             q_values, next_state_tensor = self.q_net(obs_tensor, state_tensor, episode_start_tensor)
-            actions_tensor = q_values.argmax(dim=-1)
+            
+            if not deterministic:
+                probs = th.softmax(q_values / temperature, dim=-1)
+                # Sample from the probability distribution
+                actions_tensor = th.multinomial(probs, num_samples=1).squeeze(dim=-1)
+            else:
+                actions_tensor = q_values.argmax(dim=-1)
             
             actions = actions_tensor.cpu().numpy().reshape((-1, *self.action_space.shape))
             if not vectorized_env:

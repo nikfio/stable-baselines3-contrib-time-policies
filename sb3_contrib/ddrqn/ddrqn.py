@@ -65,6 +65,9 @@ class DDRQN(OffPolicyAlgorithm):
         exploration_fraction: float = 0.1,
         exploration_initial_eps: float = 1.0,
         exploration_final_eps: float = 0.02,
+        exploration_strategy: str = "epsilon-greedy",
+        exploration_initial_temp: float = 1.0,
+        exploration_final_temp: float = 0.1,
         max_grad_norm: float = 1.0,
         sequence_length: int = 16,
         burn_in_steps: int = 4,
@@ -107,6 +110,9 @@ class DDRQN(OffPolicyAlgorithm):
         self.exploration_initial_eps = exploration_initial_eps
         self.exploration_final_eps = exploration_final_eps
         self.exploration_fraction = exploration_fraction
+        self.exploration_strategy = exploration_strategy
+        self.exploration_initial_temp = exploration_initial_temp
+        self.exploration_final_temp = exploration_final_temp
         self.target_update_interval = target_update_interval
         self.max_grad_norm = max_grad_norm
         self.sequence_length = sequence_length
@@ -114,6 +120,7 @@ class DDRQN(OffPolicyAlgorithm):
 
         self._n_calls = 0
         self.exploration_rate = 0.0
+        self.exploration_temp = 0.0
         self._last_lstm_states = None
 
         if _init_setup_model:
@@ -129,6 +136,9 @@ class DDRQN(OffPolicyAlgorithm):
         from stable_baselines3.common.utils import LinearSchedule
         self.exploration_schedule = LinearSchedule(
             self.exploration_initial_eps, self.exploration_final_eps, self.exploration_fraction
+        )
+        self.temp_schedule = LinearSchedule(
+            self.exploration_initial_temp, self.exploration_final_temp, self.exploration_fraction
         )
 
     def _create_aliases(self) -> None:
@@ -148,7 +158,9 @@ class DDRQN(OffPolicyAlgorithm):
             polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
 
         self.exploration_rate = self.exploration_schedule(self._current_progress_remaining)
+        self.exploration_temp = self.temp_schedule(self._current_progress_remaining)
         self.logger.record("rollout/exploration_rate", self.exploration_rate)
+        self.logger.record("rollout/exploration_temp", self.exploration_temp)
 
     def collect_rollouts(
         self,
@@ -178,20 +190,38 @@ class DDRQN(OffPolicyAlgorithm):
 
         continue_training = True
         while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
-            with th.no_grad():
-                obs_tensor = self.policy.obs_to_tensor(self._last_obs)[0]
-                
-                # Predict action and next LSTM states (both numpy arrays)
-                actions, next_lstm_states = self.policy.predict(
-                    obs_tensor,
-                    state=self._last_lstm_states,
-                    episode_start=self._last_episode_starts,
-                    deterministic=True
-                )
-
-            # Epsilon-greedy exploration
-            if self.num_timesteps < learning_starts or np.random.rand() < self.exploration_rate:
+            if self.num_timesteps < learning_starts:
                 actions = np.array([self.action_space.sample() for _ in range(env.num_envs)])
+                with th.no_grad():
+                    obs_tensor = self.policy.obs_to_tensor(self._last_obs)[0]
+                    _, next_lstm_states = self.policy.predict(
+                        obs_tensor,
+                        state=self._last_lstm_states,
+                        episode_start=self._last_episode_starts,
+                        deterministic=True
+                    )
+            else:
+                with th.no_grad():
+                    obs_tensor = self.policy.obs_to_tensor(self._last_obs)[0]
+                    
+                    if self.exploration_strategy == "boltzmann":
+                        actions, next_lstm_states = self.policy.predict(
+                            obs_tensor,
+                            state=self._last_lstm_states,
+                            episode_start=self._last_episode_starts,
+                            deterministic=False,
+                            temperature=self.exploration_temp
+                        )
+                    else:
+                        # Epsilon-greedy
+                        actions, next_lstm_states = self.policy.predict(
+                            obs_tensor,
+                            state=self._last_lstm_states,
+                            episode_start=self._last_episode_starts,
+                            deterministic=True
+                        )
+                        if np.random.rand() < self.exploration_rate:
+                            actions = np.array([self.action_space.sample() for _ in range(env.num_envs)])
 
             # Perform action in environment
             new_obs, rewards, dones, infos = env.step(actions)
@@ -309,18 +339,29 @@ class DDRQN(OffPolicyAlgorithm):
         """
         Overrides predict to correctly handle recurrence parameters.
         """
-        # If deterministic=False and exploring, action is epsilon-greedy
-        if not deterministic and np.random.rand() < self.exploration_rate:
-            if self.policy.is_vectorized_observation(observation):
-                n_batch = observation.shape[0]
-                action = np.array([self.action_space.sample() for _ in range(n_batch)])
+        if not deterministic:
+            if self.exploration_strategy == "boltzmann":
+                action, state = self.policy.predict(
+                    observation,
+                    state,
+                    episode_start,
+                    deterministic=False,
+                    temperature=self.exploration_temp
+                )
             else:
-                action = np.array(self.action_space.sample())
-                
-            # Run policy forward pass anyway to maintain the recurrent states
-            _, state = self.policy.predict(observation, state, episode_start, deterministic)
+                # Epsilon-greedy
+                if np.random.rand() < self.exploration_rate:
+                    if self.policy.is_vectorized_observation(observation):
+                        n_batch = observation.shape[0]
+                        action = np.array([self.action_space.sample() for _ in range(n_batch)])
+                    else:
+                        action = np.array(self.action_space.sample())
+                    # Run policy forward pass anyway to maintain the recurrent states
+                    _, state = self.policy.predict(observation, state, episode_start, deterministic=True)
+                else:
+                    action, state = self.policy.predict(observation, state, episode_start, deterministic=True)
         else:
-            action, state = self.policy.predict(observation, state, episode_start, deterministic)
+            action, state = self.policy.predict(observation, state, episode_start, deterministic=True)
 
         return action, state
 

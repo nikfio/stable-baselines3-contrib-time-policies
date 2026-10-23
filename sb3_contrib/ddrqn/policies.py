@@ -8,6 +8,7 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import Schedule
 from sb3_contrib.common.recurrent.policies import TimeCNN
 
+
 class DdrqnQNetwork(nn.Module):
     """
     Q-Network containing TimeCNN + LSTM + Dueling heads (Value & Advantage).
@@ -35,7 +36,7 @@ class DdrqnQNetwork(nn.Module):
             input_size=features_dim,
             hidden_size=lstm_hidden_size,
             num_layers=n_lstm_layers,
-            batch_first=False  # Keep false to align with process_sequence (sequence_length, batch_size, ...)
+            batch_first=False,
         )
 
         # Dueling Streams: Value & Advantage
@@ -64,21 +65,31 @@ class DdrqnQNetwork(nn.Module):
         episode_starts: th.Tensor,
     ) -> tuple[th.Tensor, tuple[th.Tensor, th.Tensor]]:
         """
-        Do a forward pass in the LSTM network, resetting states when episode_starts is 1.
+        Do a forward pass in the LSTM network, resetting states when
+        episode_starts is 1.
         """
         n_seq = lstm_states[0].shape[1]
-        
-        # Batch to sequence: (batch_size * sequence_length, features_dim) -> (sequence_length, batch_size, features_dim)
-        features_sequence = features.reshape((n_seq, -1, self.lstm.input_size)).swapaxes(0, 1)
+
+        # Batch to sequence:
+        # (batch_size * seq_len, features_dim) -> (seq_len, batch_size, dim)
+        features_sequence = features.reshape(
+            (n_seq, -1, self.lstm.input_size)
+        ).swapaxes(0, 1)
         episode_starts = episode_starts.reshape((n_seq, -1)).swapaxes(0, 1)
 
         if th.all(episode_starts == 0.0):
-            lstm_output, lstm_states = self.lstm(features_sequence, lstm_states)
-            lstm_output = th.flatten(lstm_output.transpose(0, 1), start_dim=0, end_dim=1)
+            lstm_output, lstm_states = self.lstm(
+                features_sequence, lstm_states
+            )
+            lstm_output = th.flatten(
+                lstm_output.transpose(0, 1), start_dim=0, end_dim=1
+            )
             return lstm_output, lstm_states
 
         lstm_output = []
-        for features_step, episode_start in zip(features_sequence, episode_starts, strict=True):
+        for features_step, episode_start in zip(
+            features_sequence, episode_starts, strict=True
+        ):
             hidden, lstm_states = self.lstm(
                 features_step.unsqueeze(dim=0),
                 (
@@ -87,8 +98,10 @@ class DdrqnQNetwork(nn.Module):
                 ),
             )
             lstm_output += [hidden]
-            
-        lstm_output = th.flatten(th.cat(lstm_output).transpose(0, 1), start_dim=0, end_dim=1)
+
+        lstm_output = th.flatten(
+            th.cat(lstm_output).transpose(0, 1), start_dim=0, end_dim=1
+        )
         return lstm_output, lstm_states
 
     def forward(
@@ -98,12 +111,16 @@ class DdrqnQNetwork(nn.Module):
         episode_starts: th.Tensor,
     ) -> tuple[th.Tensor, tuple[th.Tensor, th.Tensor]]:
         features = self.features_extractor(obs)
-        lstm_out, lstm_states = self._process_sequence(features, lstm_states, episode_starts)
-        
+        lstm_out, lstm_states = self._process_sequence(
+            features, lstm_states, episode_starts
+        )
+
         value = self.value_head(lstm_out)
         advantages = self.advantage_head(lstm_out)
-        q_values = value + (advantages - advantages.mean(dim=-1, keepdim=True))
-        
+        q_values = value + (
+            advantages - advantages.mean(dim=-1, keepdim=True)
+        )
+
         return q_values, lstm_states
 
     def set_training_mode(self, mode: bool) -> None:
@@ -112,7 +129,8 @@ class DdrqnQNetwork(nn.Module):
 
 class TimeCnnLstmDdrqnPolicy(BasePolicy):
     """
-    TimeCnnLstmDdrqnPolicy is a recurrent DQN policy with Dueling heads and TimeCNN feature extractor.
+    TimeCnnLstmDdrqnPolicy is a recurrent DQN policy with Dueling heads
+    and TimeCNN feature extractor.
     """
     def __init__(
         self,
@@ -140,15 +158,15 @@ class TimeCnnLstmDdrqnPolicy(BasePolicy):
         self.n_lstm_layers = n_lstm_layers
         self.val_head_arch = val_head_arch
         self.adv_head_arch = adv_head_arch
-        
+
         self.features_extractor = self.make_features_extractor()
         self.features_dim = self.features_extractor.features_dim
-        
+
         self.q_net = self.make_q_net()
         self.q_net_target = self.make_q_net()
         self.q_net_target.load_state_dict(self.q_net.state_dict())
         self.q_net_target.set_training_mode(False)
-        
+
         self.optimizer = self.optimizer_class(
             self.q_net.parameters(),
             lr=lr_schedule(1),
@@ -177,50 +195,106 @@ class TimeCnnLstmDdrqnPolicy(BasePolicy):
         temperature: float = 1.0,
     ) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
         self.set_training_mode(False)
-        
+
         with th.no_grad():
             if isinstance(observation, th.Tensor):
                 obs_tensor = observation.to(self.device)
                 vectorized_env = True
             else:
                 obs_tensor, vectorized_env = self.obs_to_tensor(observation)
-            
+
             n_envs = obs_tensor.shape[0]
-            
+
             if state is None:
                 state_tensor = (
-                    th.zeros(self.n_lstm_layers, n_envs, self.lstm_hidden_size, device=self.device),
-                    th.zeros(self.n_lstm_layers, n_envs, self.lstm_hidden_size, device=self.device)
+                    th.zeros(
+                        self.n_lstm_layers,
+                        n_envs,
+                        self.lstm_hidden_size,
+                        device=self.device,
+                    ),
+                    th.zeros(
+                        self.n_lstm_layers,
+                        n_envs,
+                        self.lstm_hidden_size,
+                        device=self.device,
+                    ),
                 )
             else:
                 state_tensor = (
-                    th.as_tensor(state[0], dtype=th.float32, device=self.device),
-                    th.as_tensor(state[1], dtype=th.float32, device=self.device)
+                    th.as_tensor(
+                        state[0], dtype=th.float32, device=self.device
+                    ),
+                    th.as_tensor(
+                        state[1], dtype=th.float32, device=self.device
+                    ),
                 )
-            
+
             if episode_start is None:
                 episode_start_tensor = th.zeros(n_envs, device=self.device)
             else:
-                episode_start_tensor = th.as_tensor(episode_start, device=self.device).float()
-                
-            q_values, next_state_tensor = self.q_net(obs_tensor, state_tensor, episode_start_tensor)
-            
+                episode_start_tensor = th.as_tensor(
+                    episode_start, device=self.device
+                ).float()
+
+            q_values, next_state_tensor = self.q_net(
+                obs_tensor, state_tensor, episode_start_tensor
+            )
+
             if not deterministic:
-                probs = th.softmax(q_values / temperature, dim=-1)
+                temp = max(float(temperature), 1e-4)
+                logits = q_values.float() / temp
+                if not th.isfinite(logits).all():
+                    logits = th.nan_to_num(
+                        logits, nan=0.0, posinf=50.0, neginf=-50.0
+                    )
+                logits = logits - logits.max(dim=-1, keepdim=True).values
+                probs = th.softmax(logits, dim=-1)
+                if (
+                    not th.isfinite(probs).all()
+                    or not (probs.sum(dim=-1) > 0).all()
+                ):
+                    probs = th.full_like(
+                        probs, 1.0 / float(self.action_space.n)
+                    )
                 # Sample from the probability distribution
-                actions_tensor = th.multinomial(probs, num_samples=1).squeeze(dim=-1)
+                actions_tensor = th.multinomial(
+                    probs, num_samples=1
+                ).squeeze(dim=-1)
             else:
-                actions_tensor = q_values.argmax(dim=-1)
-            
-            actions = actions_tensor.cpu().numpy().reshape((-1, *self.action_space.shape))
+                safe_q = (
+                    q_values
+                    if th.isfinite(q_values).all()
+                    else th.nan_to_num(
+                        q_values, nan=0.0, posinf=50.0, neginf=-50.0
+                    )
+                )
+                actions_tensor = safe_q.argmax(dim=-1)
+
+            if (
+                not th.isfinite(next_state_tensor[0]).all()
+                or not th.isfinite(next_state_tensor[1]).all()
+            ):
+                next_state_tensor = (
+                    th.nan_to_num(
+                        next_state_tensor[0], nan=0.0, posinf=1.0, neginf=-1.0
+                    ),
+                    th.nan_to_num(
+                        next_state_tensor[1], nan=0.0, posinf=1.0, neginf=-1.0
+                    ),
+                )
+
+            actions = actions_tensor.cpu().numpy().reshape(
+                (-1, *self.action_space.shape)
+            )
             if not vectorized_env:
                 actions = actions.squeeze(axis=0)
-                
+
             next_state = (
                 next_state_tensor[0].cpu().numpy(),
-                next_state_tensor[1].cpu().numpy()
+                next_state_tensor[1].cpu().numpy(),
             )
-            
+
         return actions, next_state
 
     def _predict(
@@ -230,8 +304,18 @@ class TimeCnnLstmDdrqnPolicy(BasePolicy):
     ) -> th.Tensor:
         n_envs = observation.shape[0]
         state = (
-            th.zeros(self.n_lstm_layers, n_envs, self.lstm_hidden_size, device=self.device),
-            th.zeros(self.n_lstm_layers, n_envs, self.lstm_hidden_size, device=self.device)
+            th.zeros(
+                self.n_lstm_layers,
+                n_envs,
+                self.lstm_hidden_size,
+                device=self.device,
+            ),
+            th.zeros(
+                self.n_lstm_layers,
+                n_envs,
+                self.lstm_hidden_size,
+                device=self.device,
+            ),
         )
         episode_start = th.zeros(n_envs, device=self.device)
         q_values, _ = self.q_net(observation, state, episode_start)

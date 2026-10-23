@@ -14,6 +14,7 @@ from stable_baselines3.common.torch_layers import (
 )
 from stable_baselines3.common.type_aliases import Schedule
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
 
@@ -822,8 +823,7 @@ class TimeCNN(BaseFeaturesExtractor):
                     cnn_input = obs.permute(0, 3, 1, 2)
             return self.cnn(cnn_input)
 
-        if self.training:
-            from torch.utils.checkpoint import checkpoint
+        if self.training and th.is_grad_enabled():
             # Ensure observations requires grad so that checkpointing is triggered correctly
             observations_checked = observations
             if not observations_checked.requires_grad:

@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch as th
 from sb3_contrib import DDRQN
+from sb3_contrib.ddrqn.buffers import RecurrentReplayBuffer
 from sb3_contrib.ddrqn.policies import TimeCnnLstmDdrqnPolicy
 
 
@@ -302,3 +303,51 @@ def test_ddrqn_lily_5_6_dict_obs_masking_nstep_and_layernorm_silu():
     q_vals, val = model.policy.q_net.forward_actor_and_value(raw_market_tensor)
     assert q_vals.shape == (4, 4)
     assert val.shape == (4, 1)
+
+
+def test_recurrent_replay_buffer_multi_env_batch_size():
+    """
+    Ensure RecurrentReplayBuffer samples exactly batch_size sequences across
+    multi-env setups, avoiding multiplying batch_size by n_envs.
+    """
+    dict_obs_space = spaces.Dict({
+        "market": spaces.Box(low=-1.0, high=1.0, shape=(4, 5, 3), dtype=np.float32),
+        "portfolio": spaces.Box(low=0.0, high=1.0, shape=(6,), dtype=np.float32),
+    })
+    act_space = spaces.Discrete(4)
+    n_envs = 8
+    seq_len = 5
+    batch_size = 16
+
+    buf = RecurrentReplayBuffer(
+        buffer_size=200,
+        observation_space=dict_obs_space,
+        action_space=act_space,
+        sequence_length=seq_len,
+        n_envs=n_envs,
+        optimize_memory_usage=False,
+    )
+
+    for _ in range(30):
+        obs = {
+            "market": np.random.randn(n_envs, 4, 5, 3).astype(np.float32),
+            "portfolio": np.random.randn(n_envs, 6).astype(np.float32),
+        }
+        next_obs = {
+            "market": np.random.randn(n_envs, 4, 5, 3).astype(np.float32),
+            "portfolio": np.random.randn(n_envs, 6).astype(np.float32),
+        }
+        actions = np.random.randint(0, 4, size=(n_envs, 1))
+        rewards = np.random.randn(n_envs).astype(np.float32)
+        dones = np.zeros(n_envs, dtype=bool)
+        infos = [{"action_mask": [True, True, True, True]} for _ in range(n_envs)]
+        buf.add(obs, next_obs, actions, rewards, dones, infos)
+
+    sample = buf.sample(batch_size=batch_size)
+    assert sample["observations"]["market"].shape == (batch_size, seq_len, 4, 5, 3)
+    assert sample["observations"]["portfolio"].shape == (batch_size, seq_len, 6)
+    assert sample["actions"].shape == (batch_size, seq_len, 1)
+    assert sample["rewards"].shape == (batch_size, seq_len, 1)
+    assert sample["dones"].shape == (batch_size, seq_len, 1)
+    assert sample["episode_starts"].shape == (batch_size, seq_len, 1)
+    assert sample["next_action_masks"].shape == (batch_size, seq_len, 4)

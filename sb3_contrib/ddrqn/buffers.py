@@ -167,120 +167,59 @@ class RecurrentReplayBuffer(ReplayBuffer):
             )
 
         start_indices: list[int] = []
+        env_indices: list[int] = []
         while len(start_indices) < batch_size:
             idx = int(np.random.randint(0, max_idx - self.sequence_length))
             if self.full:
-                seq_indices = np.arange(idx, idx + self.sequence_length) % self.buffer_size
+                seq_indices = (idx + np.arange(self.sequence_length)) % self.buffer_size
                 if self.pos in seq_indices:
                     continue
             start_indices.append(idx)
+            env_indices.append(int(np.random.randint(0, self.n_envs)))
 
-        return self._get_samples(start_indices)
+        return self._get_samples(np.array(start_indices, dtype=np.int64), np.array(env_indices, dtype=np.int64))
 
-    def _get_samples(self, start_indices: list[int]) -> dict[str, Any]:
-        batch_size = len(start_indices)
+    def _get_samples(self, start_indices: np.ndarray, env_indices: np.ndarray) -> dict[str, Any]:
         seq_len = self.sequence_length
 
-        actions_seq = np.zeros(
-            (batch_size, seq_len, self.n_envs, self.action_dim), dtype=self.actions.dtype
-        )
-        rewards_seq = np.zeros((batch_size, seq_len, self.n_envs), dtype=np.float32)
-        dones_seq = np.zeros((batch_size, seq_len, self.n_envs), dtype=np.float32)
-        episode_starts_seq = np.zeros((batch_size, seq_len, self.n_envs), dtype=np.float32)
-        next_masks_seq = np.ones(
-            (batch_size, seq_len, self.n_envs, self.n_actions), dtype=bool
-        )
+        # Time indices of shape (batch_size, seq_len)
+        time_indices = (start_indices[:, None] + np.arange(seq_len)) % self.buffer_size
+        # Env indices of shape (batch_size, 1) to broadcast across time
+        env_inds = env_indices[:, None]
+
+        actions_seq = self.actions[time_indices, env_inds]
+        rewards_seq = self.rewards[time_indices, env_inds]
+        dones_seq = self.dones[time_indices, env_inds]
+        episode_starts_seq = self.episode_starts[time_indices, env_inds]
+        next_masks_seq = self.next_action_masks[time_indices, env_inds]
 
         if self.is_dict_obs:
             assert isinstance(self.obs_shape, dict)
-            obs_seq_dict = {
-                key: np.zeros(
-                    (batch_size, seq_len, self.n_envs, *shape),
-                    dtype=self.observations[key].dtype,
-                )
-                for key, shape in self.obs_shape.items()
-            }
-            next_obs_seq_dict = {
-                key: np.zeros(
-                    (batch_size, seq_len, self.n_envs, *shape),
-                    dtype=self.observations[key].dtype,
-                )
-                for key, shape in self.obs_shape.items()
-            }
-            for i, start_idx in enumerate(start_indices):
-                indices = np.arange(start_idx, start_idx + seq_len) % self.buffer_size
-                for key in self.obs_shape:
-                    obs_seq_dict[key][i] = self.observations[key][indices]
-                    if self.optimize_memory_usage:
-                        next_obs_seq_dict[key][i] = self.observations[key][
-                            (indices + 1) % self.buffer_size
-                        ]
-                    else:
-                        next_obs_seq_dict[key][i] = self.next_observations[key][indices]
-                actions_seq[i] = self.actions[indices]
-                rewards_seq[i] = self.rewards[indices]
-                dones_seq[i] = self.dones[indices]
-                episode_starts_seq[i] = self.episode_starts[indices]
-                next_masks_seq[i] = self.next_action_masks[indices]
-
-            obs_torch: Any = {}
-            next_obs_torch: Any = {}
-            for key, shape in self.obs_shape.items():
-                o_arr = obs_seq_dict[key].transpose(
-                    0, 2, 1, *range(3, len(obs_seq_dict[key].shape))
-                ).reshape(batch_size * self.n_envs, seq_len, *shape)
-                no_arr = next_obs_seq_dict[key].transpose(
-                    0, 2, 1, *range(3, len(next_obs_seq_dict[key].shape))
-                ).reshape(batch_size * self.n_envs, seq_len, *shape)
-                obs_torch[key] = self.to_torch(o_arr).float()
-                next_obs_torch[key] = self.to_torch(no_arr).float()
+            obs_torch: dict[str, th.Tensor] = {}
+            next_obs_torch: dict[str, th.Tensor] = {}
+            for key in self.obs_shape:
+                obs_torch[key] = self.to_torch(self.observations[key][time_indices, env_inds]).float()
+                if self.optimize_memory_usage:
+                    next_time_indices = (time_indices + 1) % self.buffer_size
+                    next_obs_torch[key] = self.to_torch(
+                        self.observations[key][next_time_indices, env_inds]
+                    ).float()
+                else:
+                    next_obs_torch[key] = self.to_torch(
+                        self.next_observations[key][time_indices, env_inds]
+                    ).float()
         else:
             assert isinstance(self.obs_shape, tuple)
-            obs_seq = np.zeros(
-                (batch_size, seq_len, self.n_envs) + self.obs_shape,
-                dtype=self.observations.dtype,
-            )
-            next_obs_seq = np.zeros(
-                (batch_size, seq_len, self.n_envs) + self.obs_shape,
-                dtype=self.observations.dtype,
-            )
-            for i, start_idx in enumerate(start_indices):
-                indices = np.arange(start_idx, start_idx + seq_len) % self.buffer_size
-                obs_seq[i] = self.observations[indices]
-                if self.optimize_memory_usage:
-                    next_obs_seq[i] = self.observations[(indices + 1) % self.buffer_size]
-                else:
-                    next_obs_seq[i] = self.next_observations[indices]
-                actions_seq[i] = self.actions[indices]
-                rewards_seq[i] = self.rewards[indices]
-                dones_seq[i] = self.dones[indices]
-                episode_starts_seq[i] = self.episode_starts[indices]
-                next_masks_seq[i] = self.next_action_masks[indices]
-
-            obs_seq = obs_seq.transpose(
-                0, 2, 1, *range(3, len(obs_seq.shape))
-            ).reshape(batch_size * self.n_envs, seq_len, *self.obs_shape)
-            next_obs_seq = next_obs_seq.transpose(
-                0, 2, 1, *range(3, len(next_obs_seq.shape))
-            ).reshape(batch_size * self.n_envs, seq_len, *self.obs_shape)
-            obs_torch = self.to_torch(obs_seq).float()
-            next_obs_torch = self.to_torch(next_obs_seq).float()
-
-        actions_seq = actions_seq.transpose(0, 2, 1, 3).reshape(
-            batch_size * self.n_envs, seq_len, self.action_dim
-        )
-        rewards_seq = rewards_seq.transpose(0, 2, 1).reshape(
-            batch_size * self.n_envs, seq_len
-        )
-        dones_seq = dones_seq.transpose(0, 2, 1).reshape(
-            batch_size * self.n_envs, seq_len
-        )
-        episode_starts_seq = episode_starts_seq.transpose(0, 2, 1).reshape(
-            batch_size * self.n_envs, seq_len
-        )
-        next_masks_seq = next_masks_seq.transpose(0, 2, 1, 3).reshape(
-            batch_size * self.n_envs, seq_len, self.n_actions
-        )
+            obs_torch = self.to_torch(self.observations[time_indices, env_inds]).float()
+            if self.optimize_memory_usage:
+                next_time_indices = (time_indices + 1) % self.buffer_size
+                next_obs_torch = self.to_torch(
+                    self.observations[next_time_indices, env_inds]
+                ).float()
+            else:
+                next_obs_torch = self.to_torch(
+                    self.next_observations[time_indices, env_inds]
+                ).float()
 
         return dict(
             observations=obs_torch,

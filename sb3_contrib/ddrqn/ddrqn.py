@@ -158,7 +158,13 @@ class DDRQN(OffPolicyAlgorithm):
             self._setup_model()
 
     def _setup_model(self) -> None:
+        # Temporarily mask self.n_steps during super()._setup_model() to prevent SB3's generic
+        # OffPolicyAlgorithm from emitting a false-positive UserWarning regarding custom replay buffer.
+        # DDRQN natively calculates recurrent n-step TD targets across the sequence in train().
+        saved_n_steps = self.n_steps
+        self.n_steps = 1
         super()._setup_model()
+        self.n_steps = saved_n_steps
         self._create_aliases()
         # Copy running stats for batch norm (if any)
         self.batch_norm_stats = get_parameters_by_name(

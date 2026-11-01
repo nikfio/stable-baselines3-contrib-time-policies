@@ -98,13 +98,14 @@ class DDRQN(OffPolicyAlgorithm):
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
     ):
-        self.n_steps = max(1, int(n_steps))
+        resolved_n_steps = max(1, int(n_steps))
+        self.n_steps = resolved_n_steps
         self.replay_buffer_storage_dtype = str(replay_buffer_storage_dtype)
         # We need a custom replay buffer that returns sequences with enough
         # lookahead steps to compute exact n-step TD targets
         replay_buffer_kwargs = {
             "sequence_length": (
-                sequence_length + burn_in_steps + max(0, self.n_steps - 1)
+                sequence_length + burn_in_steps + max(0, resolved_n_steps - 1)
             ),
             "storage_dtype": self.replay_buffer_storage_dtype,
         }
@@ -133,6 +134,8 @@ class DDRQN(OffPolicyAlgorithm):
             supported_action_spaces=(spaces.Discrete,),
             support_multi_env=True,
         )
+
+        self.n_steps = resolved_n_steps
 
         self.exploration_initial_eps = exploration_initial_eps
         self.exploration_final_eps = exploration_final_eps

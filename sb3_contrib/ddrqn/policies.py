@@ -6,12 +6,18 @@ from gymnasium import spaces
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import Schedule
-from sb3_contrib.common.recurrent.policies import TimeCNN
+from sb3_contrib.common.recurrent.policies import (
+    TimeCNN,
+    _resolve_activation_fn,
+)
 
 
 class DdrqnQNetwork(nn.Module):
     """
     Q-Network containing TimeCNN + LSTM + Dueling heads (Value & Advantage).
+    Supports both Box observations and Dict({"market": ..., "portfolio": ...})
+    observations with portfolio skip-connections into the LSTM and Dueling
+    heads.
     """
     def __init__(
         self,
@@ -23,37 +29,58 @@ class DdrqnQNetwork(nn.Module):
         n_lstm_layers: int = 1,
         val_head_arch: list[int] = [32],
         adv_head_arch: list[int] = [32],
+        use_layer_norm: bool = False,
+        activation_fn: Type[nn.Module] | str = nn.ReLU,
     ):
         super().__init__()
+        self.observation_space = observation_space
         self.action_space = action_space
         self.features_dim = features_dim
         self.lstm_hidden_size = lstm_hidden_size
         self.n_lstm_layers = n_lstm_layers
+        self.use_layer_norm = bool(use_layer_norm)
+        self.activation_fn = _resolve_activation_fn(activation_fn)
         self.features_extractor = features_extractor
 
-        # LSTM Layer
+        if (
+            isinstance(observation_space, spaces.Dict)
+            and "portfolio" in observation_space.spaces
+        ):
+            self.portfolio_dim = int(
+                np.prod(observation_space.spaces["portfolio"].shape)
+            )
+        else:
+            self.portfolio_dim = 0
+
+        # LSTM Layer (takes CNN features + optional portfolio state)
         self.lstm = nn.LSTM(
-            input_size=features_dim,
+            input_size=features_dim + self.portfolio_dim,
             hidden_size=lstm_hidden_size,
             num_layers=n_lstm_layers,
             batch_first=False,
         )
 
-        # Dueling Streams: Value & Advantage
-        val_layers = []
-        in_dim = lstm_hidden_size
+        # Dueling Streams: Value & Advantage (with optional portfolio skip)
+        head_in_dim = lstm_hidden_size + self.portfolio_dim
+
+        val_layers: list[nn.Module] = []
+        in_dim = head_in_dim
         for h_dim in val_head_arch:
             val_layers.append(nn.Linear(in_dim, h_dim))
-            val_layers.append(nn.ReLU())
+            if self.use_layer_norm:
+                val_layers.append(nn.LayerNorm(h_dim))
+            val_layers.append(self.activation_fn())
             in_dim = h_dim
         val_layers.append(nn.Linear(in_dim, 1))
         self.value_head = nn.Sequential(*val_layers)
 
-        adv_layers = []
-        in_dim = lstm_hidden_size
+        adv_layers: list[nn.Module] = []
+        in_dim = head_in_dim
         for h_dim in adv_head_arch:
             adv_layers.append(nn.Linear(in_dim, h_dim))
-            adv_layers.append(nn.ReLU())
+            if self.use_layer_norm:
+                adv_layers.append(nn.LayerNorm(h_dim))
+            adv_layers.append(self.activation_fn())
             in_dim = h_dim
         adv_layers.append(nn.Linear(in_dim, action_space.n))
         self.advantage_head = nn.Sequential(*adv_layers)
@@ -104,24 +131,97 @@ class DdrqnQNetwork(nn.Module):
         )
         return lstm_output, lstm_states
 
+    def _extract_features_and_portfolio(
+        self, obs: th.Tensor | dict[str, th.Tensor]
+    ) -> tuple[th.Tensor, Optional[th.Tensor]]:
+        features = self.features_extractor(obs)
+        if self.portfolio_dim <= 0:
+            return features, None
+        if isinstance(obs, dict) and "portfolio" in obs:
+            portfolio = obs["portfolio"].float().view(
+                features.shape[0], self.portfolio_dim
+            )
+        else:
+            portfolio = th.zeros(
+                (features.shape[0], self.portfolio_dim),
+                dtype=features.dtype,
+                device=features.device,
+            )
+        return features, portfolio
+
     def forward(
         self,
-        obs: th.Tensor,
+        obs: th.Tensor | dict[str, th.Tensor],
         lstm_states: tuple[th.Tensor, th.Tensor],
         episode_starts: th.Tensor,
     ) -> tuple[th.Tensor, tuple[th.Tensor, th.Tensor]]:
-        features = self.features_extractor(obs)
+        features, portfolio = self._extract_features_and_portfolio(obs)
+        if portfolio is not None:
+            lstm_input = th.cat([features, portfolio], dim=-1)
+        else:
+            lstm_input = features
+
         lstm_out, lstm_states = self._process_sequence(
-            features, lstm_states, episode_starts
+            lstm_input, lstm_states, episode_starts
         )
 
-        value = self.value_head(lstm_out)
-        advantages = self.advantage_head(lstm_out)
+        if portfolio is not None:
+            head_input = th.cat([lstm_out, portfolio], dim=-1)
+        else:
+            head_input = lstm_out
+
+        value = self.value_head(head_input)
+        advantages = self.advantage_head(head_input)
         q_values = value + (
             advantages - advantages.mean(dim=-1, keepdim=True)
         )
 
         return q_values, lstm_states
+
+    def forward_actor_and_value(
+        self, obs: th.Tensor | dict[str, th.Tensor]
+    ) -> tuple[th.Tensor, th.Tensor]:
+        """
+        Stateless single-step forward helper for model decomposition /
+        functional sensitivity probing. Returns (q_values, value).
+        """
+        features, portfolio = self._extract_features_and_portfolio(obs)
+        batch_size = features.shape[0]
+        device = features.device
+        lstm_states = (
+            th.zeros(
+                self.n_lstm_layers,
+                batch_size,
+                self.lstm_hidden_size,
+                device=device,
+            ),
+            th.zeros(
+                self.n_lstm_layers,
+                batch_size,
+                self.lstm_hidden_size,
+                device=device,
+            ),
+        )
+        episode_starts = th.zeros(batch_size, device=device)
+        if portfolio is not None:
+            lstm_input = th.cat([features, portfolio], dim=-1)
+        else:
+            lstm_input = features
+
+        lstm_out, _ = self._process_sequence(
+            lstm_input, lstm_states, episode_starts
+        )
+        if portfolio is not None:
+            head_input = th.cat([lstm_out, portfolio], dim=-1)
+        else:
+            head_input = lstm_out
+
+        value = self.value_head(head_input)
+        advantages = self.advantage_head(head_input)
+        q_values = value + (
+            advantages - advantages.mean(dim=-1, keepdim=True)
+        )
+        return q_values, value
 
     def set_training_mode(self, mode: bool) -> None:
         self.train(mode)
@@ -145,12 +245,19 @@ class TimeCnnLstmDdrqnPolicy(BasePolicy):
         n_lstm_layers: int = 1,
         val_head_arch: list[int] = [32],
         adv_head_arch: list[int] = [32],
+        use_layer_norm: bool = False,
+        activation_fn: Type[nn.Module] | str = nn.ReLU,
     ):
+        extractor_kwargs = dict(features_extractor_kwargs or {})
+        if features_extractor_class is TimeCNN:
+            extractor_kwargs.setdefault("use_layer_norm", use_layer_norm)
+            extractor_kwargs.setdefault("activation_fn", activation_fn)
+
         super().__init__(
             observation_space,
             action_space,
             features_extractor_class,
-            features_extractor_kwargs,
+            extractor_kwargs,
             optimizer_class=optimizer_class,
             optimizer_kwargs=optimizer_kwargs,
         )
@@ -158,6 +265,8 @@ class TimeCnnLstmDdrqnPolicy(BasePolicy):
         self.n_lstm_layers = n_lstm_layers
         self.val_head_arch = val_head_arch
         self.adv_head_arch = adv_head_arch
+        self.use_layer_norm = bool(use_layer_norm)
+        self.activation_fn = _resolve_activation_fn(activation_fn)
 
         self.features_extractor = self.make_features_extractor()
         self.features_dim = self.features_extractor.features_dim
@@ -184,7 +293,36 @@ class TimeCnnLstmDdrqnPolicy(BasePolicy):
             n_lstm_layers=self.n_lstm_layers,
             val_head_arch=self.val_head_arch,
             adv_head_arch=self.adv_head_arch,
+            use_layer_norm=self.use_layer_norm,
+            activation_fn=self.activation_fn,
         ).to(self.device)
+
+    @staticmethod
+    def _batch_size_from_obs_tensor(
+        obs_tensor: th.Tensor | dict[str, th.Tensor]
+    ) -> int:
+        if isinstance(obs_tensor, dict):
+            first_tensor = next(iter(obs_tensor.values()))
+            return int(first_tensor.shape[0])
+        return int(obs_tensor.shape[0])
+
+    def _apply_action_masks(
+        self,
+        q_values: th.Tensor,
+        action_masks: Optional[np.ndarray | th.Tensor],
+    ) -> tuple[th.Tensor, Optional[th.Tensor]]:
+        if action_masks is None:
+            return q_values, None
+        mask_tensor = th.as_tensor(
+            action_masks, dtype=th.bool, device=q_values.device
+        ).view(-1, self.action_space.n)
+        # Guard against an all-False row
+        valid_rows = mask_tensor.any(dim=-1, keepdim=True)
+        safe_mask = th.where(
+            valid_rows, mask_tensor, th.ones_like(mask_tensor)
+        )
+        masked_q = q_values.masked_fill(~safe_mask, -1e8)
+        return masked_q, safe_mask
 
     def predict(
         self,
@@ -193,17 +331,27 @@ class TimeCnnLstmDdrqnPolicy(BasePolicy):
         episode_start: Optional[np.ndarray] = None,
         deterministic: bool = True,
         temperature: float = 1.0,
+        action_masks: Optional[np.ndarray | th.Tensor] = None,
     ) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
         self.set_training_mode(False)
 
         with th.no_grad():
             if isinstance(observation, th.Tensor):
-                obs_tensor = observation.to(self.device)
+                obs_tensor: th.Tensor | dict[str, th.Tensor] = observation.to(
+                    self.device
+                )
+                vectorized_env = True
+            elif isinstance(observation, dict) and all(
+                isinstance(v, th.Tensor) for v in observation.values()
+            ):
+                obs_tensor = {
+                    k: v.to(self.device) for k, v in observation.items()
+                }
                 vectorized_env = True
             else:
                 obs_tensor, vectorized_env = self.obs_to_tensor(observation)
 
-            n_envs = obs_tensor.shape[0]
+            n_envs = self._batch_size_from_obs_tensor(obs_tensor)
 
             if state is None:
                 state_tensor = (
@@ -241,35 +389,47 @@ class TimeCnnLstmDdrqnPolicy(BasePolicy):
                 obs_tensor, state_tensor, episode_start_tensor
             )
 
+            safe_q = (
+                q_values
+                if th.isfinite(q_values).all()
+                else th.nan_to_num(
+                    q_values, nan=0.0, posinf=50.0, neginf=-50.0
+                )
+            )
+            masked_q, safe_mask = self._apply_action_masks(
+                safe_q, action_masks
+            )
+
             if not deterministic:
                 temp = max(float(temperature), 1e-4)
-                logits = q_values.float() / temp
-                if not th.isfinite(logits).all():
-                    logits = th.nan_to_num(
-                        logits, nan=0.0, posinf=50.0, neginf=-50.0
-                    )
+                logits = masked_q.float() / temp
+                if safe_mask is not None:
+                    logits = logits.masked_fill(~safe_mask, -1e8)
                 logits = logits - logits.max(dim=-1, keepdim=True).values
                 probs = th.softmax(logits, dim=-1)
-                if (
+                if safe_mask is not None:
+                    probs = probs * safe_mask.float()
+                    row_sums = probs.sum(dim=-1, keepdim=True)
+                    probs = th.where(
+                        row_sums > 0,
+                        probs / row_sums.clamp(min=1e-8),
+                        safe_mask.float()
+                        / safe_mask.float().sum(dim=-1, keepdim=True).clamp(
+                            min=1.0
+                        ),
+                    )
+                elif (
                     not th.isfinite(probs).all()
                     or not (probs.sum(dim=-1) > 0).all()
                 ):
                     probs = th.full_like(
                         probs, 1.0 / float(self.action_space.n)
                     )
-                # Sample from the probability distribution
                 actions_tensor = th.multinomial(
                     probs, num_samples=1
                 ).squeeze(dim=-1)
             else:
-                safe_q = (
-                    q_values
-                    if th.isfinite(q_values).all()
-                    else th.nan_to_num(
-                        q_values, nan=0.0, posinf=50.0, neginf=-50.0
-                    )
-                )
-                actions_tensor = safe_q.argmax(dim=-1)
+                actions_tensor = masked_q.argmax(dim=-1)
 
             if (
                 not th.isfinite(next_state_tensor[0]).all()
@@ -299,10 +459,10 @@ class TimeCnnLstmDdrqnPolicy(BasePolicy):
 
     def _predict(
         self,
-        observation: th.Tensor,
+        observation: th.Tensor | dict[str, th.Tensor],
         deterministic: bool = True,
     ) -> th.Tensor:
-        n_envs = observation.shape[0]
+        n_envs = self._batch_size_from_obs_tensor(observation)
         state = (
             th.zeros(
                 self.n_lstm_layers,

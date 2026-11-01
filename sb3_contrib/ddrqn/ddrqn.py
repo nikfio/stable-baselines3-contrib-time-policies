@@ -88,6 +88,8 @@ class DDRQN(OffPolicyAlgorithm):
         max_grad_norm: float = 1.0,
         sequence_length: int = 16,
         burn_in_steps: int = 4,
+        n_steps: int = 1,
+        replay_buffer_storage_dtype: str = "float32",
         stats_window_size: int = 100,
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[dict[str, Any]] = None,
@@ -96,9 +98,15 @@ class DDRQN(OffPolicyAlgorithm):
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
     ):
-        # We need a custom replay buffer that returns sequences
+        self.n_steps = max(1, int(n_steps))
+        self.replay_buffer_storage_dtype = str(replay_buffer_storage_dtype)
+        # We need a custom replay buffer that returns sequences with enough
+        # lookahead steps to compute exact n-step TD targets
         replay_buffer_kwargs = {
-            "sequence_length": sequence_length + burn_in_steps
+            "sequence_length": (
+                sequence_length + burn_in_steps + max(0, self.n_steps - 1)
+            ),
+            "storage_dtype": self.replay_buffer_storage_dtype,
         }
 
         super().__init__(
@@ -141,6 +149,7 @@ class DDRQN(OffPolicyAlgorithm):
         self.exploration_rate = float(self.exploration_initial_eps)
         self.exploration_temp = float(self.exploration_initial_temp)
         self._last_lstm_states = None
+        self._last_action_masks: Optional[np.ndarray] = None
 
         if _init_setup_model:
             self._setup_model()
@@ -236,12 +245,22 @@ class DDRQN(OffPolicyAlgorithm):
                 np.zeros(shape, dtype=np.float32),
             )
 
+        if self._last_action_masks is None:
+            try:
+                masks = env.env_method("action_masks")
+                if masks is not None and all(m is not None for m in masks):
+                    self._last_action_masks = np.asarray(
+                        masks, dtype=np.bool_
+                    ).reshape(env.num_envs, self.action_space.n)
+            except Exception:
+                self._last_action_masks = None
+
         while should_collect_more_steps(
             train_freq, num_collected_steps, num_collected_episodes
         ):
             if self.num_timesteps < learning_starts:
-                actions = np.array(
-                    [self.action_space.sample() for _ in range(env.num_envs)]
+                actions = self._sample_random_actions(
+                    env.num_envs, self._last_action_masks
                 )
                 with th.no_grad():
                     obs_tensor = self.policy.obs_to_tensor(self._last_obs)[0]
@@ -250,6 +269,7 @@ class DDRQN(OffPolicyAlgorithm):
                         state=self._last_lstm_states,
                         episode_start=self._last_episode_starts,
                         deterministic=True,
+                        action_masks=self._last_action_masks,
                     )
             else:
                 with th.no_grad():
@@ -262,6 +282,7 @@ class DDRQN(OffPolicyAlgorithm):
                             episode_start=self._last_episode_starts,
                             deterministic=False,
                             temperature=self.exploration_temp,
+                            action_masks=self._last_action_masks,
                         )
                     else:
                         # Epsilon-greedy
@@ -270,13 +291,11 @@ class DDRQN(OffPolicyAlgorithm):
                             state=self._last_lstm_states,
                             episode_start=self._last_episode_starts,
                             deterministic=True,
+                            action_masks=self._last_action_masks,
                         )
                         if np.random.rand() < self.exploration_rate:
-                            actions = np.array(
-                                [
-                                    self.action_space.sample()
-                                    for _ in range(env.num_envs)
-                                ]
+                            actions = self._sample_random_actions(
+                                env.num_envs, self._last_action_masks
                             )
 
             # Perform action in environment
@@ -309,6 +328,24 @@ class DDRQN(OffPolicyAlgorithm):
             self._last_obs = new_obs
             self._last_episode_starts = dones
             self._last_lstm_states = next_lstm_states
+            if any("action_mask" in info for info in infos):
+                next_masks = []
+                for env_idx, info in enumerate(infos):
+                    if dones[env_idx]:
+                        try:
+                            m = env.env_method(
+                                "action_masks", indices=[env_idx]
+                            )[0]
+                        except Exception:
+                            m = info.get("action_mask")
+                    else:
+                        m = info.get("action_mask")
+                    if m is None:
+                        m = np.ones(self.action_space.n, dtype=np.bool_)
+                    next_masks.append(np.asarray(m, dtype=np.bool_))
+                self._last_action_masks = np.asarray(
+                    next_masks, dtype=np.bool_
+                ).reshape(env.num_envs, self.action_space.n)
 
             for done in dones:
                 if done:
@@ -322,10 +359,33 @@ class DDRQN(OffPolicyAlgorithm):
             continue_training=True,
         )
 
+    def _sample_random_actions(
+        self,
+        n_envs: int,
+        action_masks: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        if action_masks is None:
+            return np.array(
+                [self.action_space.sample() for _ in range(n_envs)]
+            )
+        sampled = []
+        masks_arr = np.asarray(action_masks, dtype=np.bool_).reshape(
+            n_envs, self.action_space.n
+        )
+        for i in range(n_envs):
+            valid_indices = np.flatnonzero(masks_arr[i])
+            if valid_indices.size > 0:
+                sampled.append(int(np.random.choice(valid_indices)))
+            else:
+                sampled.append(int(self.action_space.sample()))
+        return np.array(sampled)
+
     def train(self, gradient_steps: int, batch_size: int = 32) -> None:
         # Switch to training mode
         self.policy.set_training_mode(True)
         self._update_learning_rate(self.policy.optimizer)
+
+        active_seq_len = self.sequence_length + self.burn_in_steps
 
         losses = []
         for _ in range(gradient_steps):
@@ -334,15 +394,27 @@ class DDRQN(OffPolicyAlgorithm):
                 batch_size, env=self._vec_normalize_env
             )
 
-            curr_batch_size = replay_data["observations"].shape[0]
-            seq_len = replay_data["observations"].shape[1]
+            if isinstance(replay_data["observations"], dict):
+                first_obs = next(iter(replay_data["observations"].values()))
+                curr_batch_size = int(first_obs.shape[0])
+                seq_len = int(first_obs.shape[1])
+                flat_obs: th.Tensor | dict[str, th.Tensor] = {
+                    k: v.view(-1, *self.observation_space.spaces[k].shape)
+                    for k, v in replay_data["observations"].items()
+                }
+                flat_next_obs: th.Tensor | dict[str, th.Tensor] = {
+                    k: v.view(-1, *self.observation_space.spaces[k].shape)
+                    for k, v in replay_data["next_observations"].items()
+                }
+            else:
+                curr_batch_size = int(replay_data["observations"].shape[0])
+                seq_len = int(replay_data["observations"].shape[1])
+                obs_shape = self.observation_space.shape
+                flat_obs = replay_data["observations"].view(-1, *obs_shape)
+                flat_next_obs = replay_data["next_observations"].view(
+                    -1, *obs_shape
+                )
 
-            # Flatten temporal and batch dimensions for TimeCNN extractor
-            obs_shape = self.observation_space.shape
-            flat_obs = replay_data["observations"].view(-1, *obs_shape)
-            flat_next_obs = replay_data["next_observations"].view(
-                -1, *obs_shape
-            )
             flat_episode_starts = replay_data["episode_starts"].view(-1, 1)
             flat_next_episode_starts = replay_data["dones"].view(-1, 1)
 
@@ -367,7 +439,7 @@ class DDRQN(OffPolicyAlgorithm):
 
             # Gather Q-values for actions taken
             actions = replay_data["actions"].long()
-            current_q = th.gather(q_values, dim=2, index=actions)
+            current_q_all = th.gather(q_values, dim=2, index=actions)
 
             # Compute TD Target (Double DQN / Target network evaluation)
             with th.no_grad():
@@ -386,7 +458,7 @@ class DDRQN(OffPolicyAlgorithm):
                     curr_batch_size, seq_len, self.action_space.n
                 )
 
-                # Greedy actions from online network
+                # Greedy actions from online network (masked for valid actions)
                 online_next_q_values, _ = self.q_net(
                     flat_next_obs,
                     target_lstm_states,
@@ -395,17 +467,60 @@ class DDRQN(OffPolicyAlgorithm):
                 online_next_q_values = online_next_q_values.view(
                     curr_batch_size, seq_len, self.action_space.n
                 )
+                if "next_action_masks" in replay_data:
+                    next_masks = replay_data["next_action_masks"].bool()
+                    valid_rows = next_masks.any(dim=-1, keepdim=True)
+                    safe_next_masks = th.where(
+                        valid_rows, next_masks, th.ones_like(next_masks)
+                    )
+                    online_next_q_values = online_next_q_values.masked_fill(
+                        ~safe_next_masks, -1e8
+                    )
                 next_actions = online_next_q_values.argmax(
                     dim=-1, keepdim=True
                 )
 
                 next_q = th.gather(next_q_values, dim=2, index=next_actions)
 
-                # y_t = r_t + gamma * (1 - done_t) * Q_target(s_t+1, a*)
-                target_q = (
-                    replay_data["rewards"]
-                    + (1.0 - replay_data["dones"]) * self.gamma * next_q
-                )
+                eval_len = min(active_seq_len, seq_len)
+                if self.n_steps <= 1:
+                    target_q_all = (
+                        replay_data["rewards"][:, :eval_len]
+                        + (1.0 - replay_data["dones"][:, :eval_len])
+                        * self.gamma
+                        * next_q[:, :eval_len]
+                    )
+                else:
+                    # Exact n-step TD target truncated at episode boundaries
+                    rewards_seq = replay_data["rewards"]
+                    dones_seq = replay_data["dones"]
+                    target_q_all = th.zeros(
+                        (curr_batch_size, eval_len, 1),
+                        dtype=next_q.dtype,
+                        device=self.device,
+                    )
+                    alive = th.ones(
+                        (curr_batch_size, eval_len, 1),
+                        dtype=next_q.dtype,
+                        device=self.device,
+                    )
+                    last_valid_next_q = next_q[:, :eval_len]
+                    max_k = min(self.n_steps, seq_len - eval_len + 1)
+                    for k in range(max_k):
+                        r_k = rewards_seq[:, k:k + eval_len]
+                        d_k = dones_seq[:, k:k + eval_len]
+                        target_q_all = (
+                            target_q_all + (self.gamma ** k) * alive * r_k
+                        )
+                        alive = alive * (1.0 - d_k)
+                        last_valid_next_q = next_q[:, k:k + eval_len]
+                    target_q_all = (
+                        target_q_all
+                        + (self.gamma ** max_k) * alive * last_valid_next_q
+                    )
+
+            current_q = current_q_all[:, :eval_len]
+            target_q = target_q_all
 
             # Apply burn-in period to exclude initial steps from backprop loss
             if self.burn_in_steps > 0:
@@ -465,13 +580,15 @@ class DDRQN(OffPolicyAlgorithm):
 
     def predict(
         self,
-        observation: np.ndarray,
+        observation: Any,
         state: Optional[tuple[np.ndarray, ...]] = None,
         episode_start: Optional[np.ndarray] = None,
         deterministic: bool = False,
+        action_masks: Optional[np.ndarray] = None,
     ) -> tuple[np.ndarray, Optional[tuple[np.ndarray, ...]]]:
         """
-        Overrides predict to correctly handle recurrence parameters.
+        Overrides predict to correctly handle recurrence parameters and
+        optional action_masks.
         """
         if not deterministic:
             if self.exploration_strategy == "boltzmann":
@@ -481,31 +598,48 @@ class DDRQN(OffPolicyAlgorithm):
                     episode_start,
                     deterministic=False,
                     temperature=self.exploration_temp,
+                    action_masks=action_masks,
                 )
             else:
                 # Epsilon-greedy
                 if np.random.rand() < self.exploration_rate:
                     if self.policy.is_vectorized_observation(observation):
-                        n_batch = observation.shape[0]
-                        action = np.array(
-                            [
-                                self.action_space.sample()
-                                for _ in range(n_batch)
-                            ]
+                        if isinstance(observation, dict):
+                            n_batch = int(
+                                next(iter(observation.values())).shape[0]
+                            )
+                        else:
+                            n_batch = int(observation.shape[0])
+                        action = self._sample_random_actions(
+                            n_batch, action_masks
                         )
                     else:
-                        action = np.array(self.action_space.sample())
+                        action = self._sample_random_actions(
+                            1, action_masks
+                        ).squeeze(axis=0)
                     # Run policy forward pass to maintain recurrent states
                     _, state = self.policy.predict(
-                        observation, state, episode_start, deterministic=True
+                        observation,
+                        state,
+                        episode_start,
+                        deterministic=True,
+                        action_masks=action_masks,
                     )
                 else:
                     action, state = self.policy.predict(
-                        observation, state, episode_start, deterministic=True
+                        observation,
+                        state,
+                        episode_start,
+                        deterministic=True,
+                        action_masks=action_masks,
                     )
         else:
             action, state = self.policy.predict(
-                observation, state, episode_start, deterministic=True
+                observation,
+                state,
+                episode_start,
+                deterministic=True,
+                action_masks=action_masks,
             )
 
         return action, state
@@ -533,6 +667,7 @@ class DDRQN(OffPolicyAlgorithm):
             "q_net",
             "q_net_target",
             "_last_lstm_states",
+            "_last_action_masks",
         ]
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:

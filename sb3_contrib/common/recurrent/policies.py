@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Type
 
 import numpy as np
 import torch as th
@@ -676,28 +676,63 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
         )
 
 
+def _resolve_activation_fn(
+    activation_fn: Type[nn.Module] | str | None,
+) -> Type[nn.Module]:
+    """Resolve activation function class from string name or Module type."""
+    if activation_fn is None:
+        return nn.ReLU
+    if isinstance(activation_fn, str):
+        mapping: dict[str, Type[nn.Module]] = {
+            "relu": nn.ReLU,
+            "silu": nn.SiLU,
+            "swish": nn.SiLU,
+            "gelu": nn.GELU,
+            "elu": nn.ELU,
+            "tanh": nn.Tanh,
+            "leaky_relu": nn.LeakyReLU,
+        }
+        return mapping.get(activation_fn.strip().lower(), nn.SiLU)
+    return activation_fn
+
+
 class TimeCNN(BaseFeaturesExtractor):
     """
     2D CNN Features Extractor for time-series / windowed observations.
-    Expects observations of shape (horizon_backward, num_candles, 4).
+    Expects observations of shape (horizon_backward, num_candles, 4) or
+    a spaces.Dict containing a 3D 'market' Box.
     Convolves along both the horizon_backward (time) and num_candles dimensions.
     """
     def __init__(
         self,
-        observation_space: spaces.Box,
+        observation_space: spaces.Space,
         features_dim: int | None = None,
         cnn_layers: list[int] | None = None,
         n_cnn_layers: int = 2,
         fc_layers: list[int] | None = None,
         enable_fc: bool = True,
+        use_layer_norm: bool = False,
+        activation_fn: Type[nn.Module] | str = nn.ReLU,
     ):
-        assert isinstance(observation_space, spaces.Box), (
-            f"TimeCNN must be used with spaces.Box observation space, "
-            f"not {observation_space}"
+        if isinstance(observation_space, spaces.Dict):
+            assert "market" in observation_space.spaces, (
+                f"TimeCNN with spaces.Dict requires a 'market' key, "
+                f"got keys {list(observation_space.spaces.keys())}"
+            )
+            market_space = observation_space.spaces["market"]
+        else:
+            market_space = observation_space
+
+        assert isinstance(market_space, spaces.Box), (
+            f"TimeCNN market space must be spaces.Box, not {market_space}"
         )
-        assert len(observation_space.shape) == 3, (
-            f"TimeCNN expects a 3D observation space, got shape {observation_space.shape}"
+        assert len(market_space.shape) == 3, (
+            f"TimeCNN expects a 3D market observation space, got shape {market_space.shape}"
         )
+
+        act_cls = _resolve_activation_fn(activation_fn)
+        self.use_layer_norm = bool(use_layer_norm)
+        self.activation_fn = act_cls
         
         if cnn_layers is None:
             cnn_layers = []
@@ -711,11 +746,11 @@ class TimeCNN(BaseFeaturesExtractor):
         # Detect layout transposition based on shape comparison
         # Default: (horizon_backward, num_candles, num_features)
         # Transposed: (num_features, num_candles, horizon_backward)
-        is_transposed = (observation_space.shape[0] < observation_space.shape[2])
+        is_transposed = (market_space.shape[0] < market_space.shape[2])
         if is_transposed:
-            num_features, num_candles, horizon_backward = observation_space.shape
+            num_features, num_candles, horizon_backward = market_space.shape
         else:
-            horizon_backward, num_candles, num_features = observation_space.shape
+            horizon_backward, num_candles, num_features = market_space.shape
 
         self.is_transposed = is_transposed
         self.enable_fc = enable_fc
@@ -726,18 +761,20 @@ class TimeCNN(BaseFeaturesExtractor):
             if fc_layers is None:
                 fc_layers = [64]
                 
-            fc_modules = []
+            fc_modules: list[nn.Module] = []
             current_features = horizon_backward if is_transposed else num_features
             for out_features in fc_layers:
                 fc_modules.append(nn.Linear(current_features, out_features))
-                fc_modules.append(nn.ReLU())
+                if self.use_layer_norm:
+                    fc_modules.append(nn.LayerNorm(out_features))
+                fc_modules.append(act_cls())
                 current_features = out_features
             fc_seq = nn.Sequential(*fc_modules)
             current_channels = current_features
         else:
             current_channels = num_features
         
-        layers = []
+        layers: list[nn.Module] = []
         if enable_fc:
             if is_transposed:
                 current_height = num_features
@@ -766,7 +803,7 @@ class TimeCNN(BaseFeaturesExtractor):
                     padding=padding
                 )
             )
-            layers.append(nn.ReLU())
+            layers.append(act_cls())
             
             # MaxPool2d pooling only when height/width is large enough to avoid shrinking to 0
             pool_h = 2 if current_height >= 4 else 1
@@ -783,7 +820,7 @@ class TimeCNN(BaseFeaturesExtractor):
         
         # Resolve flattened size dynamically using local cnn_seq and fc_stage
         with th.no_grad():
-            dummy = th.as_tensor(observation_space.sample()[None]).float()
+            dummy = th.as_tensor(market_space.sample()[None]).float()
             if fc_seq is not None:
                 dummy_fc = fc_seq(dummy)
                 cnn_input = dummy_fc.permute(0, 3, 1, 2)
@@ -804,12 +841,18 @@ class TimeCNN(BaseFeaturesExtractor):
         if features_dim is None:
             self.linear = nn.Identity()
         else:
-            self.linear = nn.Sequential(
-                nn.Linear(n_flatten, features_dim),
-                nn.ReLU()
-            )
+            proj_layers: list[nn.Module] = [nn.Linear(n_flatten, features_dim)]
+            if self.use_layer_norm:
+                proj_layers.append(nn.LayerNorm(features_dim))
+            proj_layers.append(act_cls())
+            self.linear = nn.Sequential(*proj_layers)
 
-    def forward(self, observations: th.Tensor) -> th.Tensor:
+    def forward(self, observations: th.Tensor | dict[str, th.Tensor]) -> th.Tensor:
+        if isinstance(observations, dict):
+            market_obs = observations["market"]
+        else:
+            market_obs = observations
+
         # Pass observations through the fully connected stage and CNN stage.
         # Use PyTorch gradient checkpointing during training to avoid CUDA OOM.
         def _forward_helper(obs: th.Tensor) -> th.Tensor:
@@ -825,12 +868,12 @@ class TimeCNN(BaseFeaturesExtractor):
 
         if self.training and th.is_grad_enabled():
             # Ensure observations requires grad so that checkpointing is triggered correctly
-            observations_checked = observations
+            observations_checked = market_obs
             if not observations_checked.requires_grad:
                 observations_checked = observations_checked.detach().requires_grad_(True)
             cnn_out = checkpoint(_forward_helper, observations_checked, use_reentrant=False)
         else:
-            cnn_out = _forward_helper(observations)
+            cnn_out = _forward_helper(market_obs)
 
         return self.linear(cnn_out)
 
